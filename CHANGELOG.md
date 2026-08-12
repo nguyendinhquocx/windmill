@@ -1,5 +1,53 @@
 # Changelog
 
+## [1.788.0](https://github.com/windmill-labs/windmill/compare/v1.787.0...v1.788.0) (2026-08-12)
+
+
+### Features
+
+* **sessions:** persist artifact version selection in preview tabs ([#10655](https://github.com/windmill-labs/windmill/issues/10655)) ([73b71a8](https://github.com/windmill-labs/windmill/commit/73b71a8fac61069274460ac8151041677c7c5f2d))
+
+
+### Bug Fixes
+
+* harden custom env var name handling in the nativets/bun prologue ([#10634](https://github.com/windmill-labs/windmill/issues/10634)) ([84f3b00](https://github.com/windmill-labs/windmill/commit/84f3b0094d0659ac3e458ef9ebe5768d181524c3))
+* home search matches each term instead of the whole query verbatim ([#10663](https://github.com/windmill-labs/windmill/issues/10663)) ([603b201](https://github.com/windmill-labs/windmill/commit/603b2012a7d2a03eb1a9bb4cb60bd59bc1859078))
+
+## [1.787.0](https://github.com/windmill-labs/windmill/compare/v1.786.1...v1.787.0) (2026-08-12)
+
+
+### Features
+
+* expose every runs filter on the open_page chat tool ([#10612](https://github.com/windmill-labs/windmill/issues/10612)) ([ce58b84](https://github.com/windmill-labs/windmill/commit/ce58b8495c8a0a4ad0fe3eddae6dec1f447b89f8))
+
+
+### Bug Fixes
+
+* **schedule:** hoist non-RLS reads out of the create_schedule tx ([#10658](https://github.com/windmill-labs/windmill/issues/10658)) ([f4a935b](https://github.com/windmill-labs/windmill/commit/f4a935bd1c4f8ae336824b61e0648e8b0d91f8c9))
+* stop the AI chat destroying secret variables on edit ([#10616](https://github.com/windmill-labs/windmill/issues/10616)) ([eb238e3](https://github.com/windmill-labs/windmill/commit/eb238e3f0b63acfabe0b8b7c69e8219cc0448f89))
+
+## [1.786.1](https://github.com/windmill-labs/windmill/compare/v1.786.0...v1.786.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* avoid content shift on home page load and in the script editor logs pane ([#10654](https://github.com/windmill-labs/windmill/issues/10654)) ([2808150](https://github.com/windmill-labs/windmill/commit/2808150ae4c39a76be21a38a2d739fd071dde8cd))
+* bound postgres result collection so an oversized result cannot OOM the worker ([#10644](https://github.com/windmill-labs/windmill/issues/10644)) ([201d7c4](https://github.com/windmill-labs/windmill/commit/201d7c4eb2f5fdcdc2a64698c1595e108c2daddf))
+* **frontend:** skip reserved ids when auto-assigning flow module ids ([#10651](https://github.com/windmill-labs/windmill/issues/10651)) ([5f819cd](https://github.com/windmill-labs/windmill/commit/5f819cd344ea602c4c06f93ff3da11a685f283c2))
+
+## [1.786.0](https://github.com/windmill-labs/windmill/compare/v1.785.0...v1.786.0) (2026-08-12)
+
+
+### Features
+
+* bound how much disk a single duckdb job can spill ([#10645](https://github.com/windmill-labs/windmill/issues/10645)) ([a6157ba](https://github.com/windmill-labs/windmill/commit/a6157ba1046b046466212a3370e0cfb8796f4b59))
+
+
+### Bug Fixes
+
+* bound duckdb result collection so an oversized result cannot OOM the worker ([#10641](https://github.com/windmill-labs/windmill/issues/10641)) ([00822a7](https://github.com/windmill-labs/windmill/commit/00822a7435328b38a5a3bd1ee6d9a1556ca2d0c0))
+* **copilot:** read an artifact inside the transaction that revises it ([#10647](https://github.com/windmill-labs/windmill/issues/10647)) ([66c0d12](https://github.com/windmill-labs/windmill/commit/66c0d1251dcb3ed4cdf3b2010d3f5a4e95378341))
+
 ## [1.785.0](https://github.com/windmill-labs/windmill/compare/v1.784.0...v1.785.0) (2026-08-11)
 
 

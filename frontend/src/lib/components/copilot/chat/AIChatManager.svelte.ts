@@ -1,6 +1,8 @@
 import type { ScriptLang } from '$lib/gen/types.gen'
 import { JobService, type CompletedJob } from '$lib/gen'
 import type { FlowOptions, ScriptOptions } from './ContextManager.svelte'
+import { getAiAgentProviderCatalog } from './flow/aiAgentProviderCatalog'
+import { formatAiAgentProvidersPrompt } from './flow/aiAgentProviders'
 import {
 	flowTools,
 	prepareFlowSystemMessage,
@@ -115,6 +117,8 @@ import {
 	globalToolsFor,
 	loadWorkspaceSkills,
 	prepareGlobalSystemMessage,
+	resolveGlobalPromptIdentity,
+	type GlobalPromptIdentity,
 	prepareGlobalUserMessage,
 	type AiSkillListItem,
 	type ChatCommandItem,
@@ -1079,6 +1083,12 @@ export class AIChatManager {
 	mcpServers = $state<McpServer[]>([])
 	private mcpServersRefreshId = 0
 
+	// The GLOBAL prompt's path conventions and folder ACLs, for this chat's operating
+	// workspace (`GlobalPromptIdentity`). Resolved asynchronously alongside skills, never
+	// read from the ambient user store.
+	private globalIdentity = $state<GlobalPromptIdentity | undefined>(undefined)
+	private globalIdentityRefreshId = 0
+
 	// Built-in session-chat slash commands, listed in the command picker
 	// alongside workspace skills. Unlike a skill, these run locally and never
 	// reach the model; the submit path intercepts them first, so they shadow any
@@ -1929,6 +1939,7 @@ export class AIChatManager {
 			const customPrompt = getCombinedCustomPrompt(mode)
 			this.systemMessage = prepareFlowSystemMessage(customPrompt)
 			this.systemMessage.content = this.systemMessage.content
+			this.appendFlowAiAgentProviders(this.systemMessage)
 			this.tools = [...flowTools]
 			this.helpers = {
 				...(this.flowAiChatHelpers ?? {}),
@@ -1951,6 +1962,7 @@ export class AIChatManager {
 			this.helpers = {}
 		} else if (mode === AIMode.GLOBAL) {
 			this.configureGlobalMode()
+			void this.refreshGlobalIdentity()
 			void this.refreshGlobalSkills()
 			void this.refreshMcpServers()
 		} else if (mode === AIMode.APP) {
@@ -1971,6 +1983,7 @@ export class AIChatManager {
 	private configureGlobalMode = () => {
 		const systemMessage = prepareGlobalSystemMessage(getCustomPromptParts(AIMode.GLOBAL), {
 			previewTools: this.isSessionChat,
+			user: this.globalIdentity,
 			skills: this.globalSkills,
 			mcpServers: this.mcpServers
 		})
@@ -2036,6 +2049,20 @@ export class AIChatManager {
 		}
 	}
 
+	// Same shape as refreshGlobalSkills. An identity that resolves after the operating
+	// workspace moved describes the workspace left behind, so it is dropped, not installed.
+	refreshGlobalIdentity = async (workspace = this.operatingWorkspace ?? '') => {
+		const refreshId = ++this.globalIdentityRefreshId
+		const identity = await resolveGlobalPromptIdentity(workspace)
+		if (refreshId !== this.globalIdentityRefreshId) {
+			return
+		}
+		this.globalIdentity = workspace === (this.operatingWorkspace ?? '') ? identity : undefined
+		if (this.mode === AIMode.GLOBAL) {
+			this.configureGlobalMode()
+		}
+	}
+
 	// Same shape as refreshGlobalSkills: rebuild GLOBAL mode once the connected
 	// MCP servers resolve so the next chat-loop iteration advertises their tools,
 	// ignoring stale resolves so a workspace change cannot overwrite newer ones.
@@ -2059,6 +2086,20 @@ export class AIChatManager {
 		}
 	}
 
+	// The workspace's AI provider resources and their models exist only at run time, so they are
+	// appended once the catalog resolves. The chat loop re-reads this.systemMessage on every
+	// iteration, so a send that beats the fetch still picks them up on the next one.
+	private appendFlowAiAgentProviders = async (target: ChatCompletionSystemMessageParam) => {
+		const catalog = await getAiAgentProviderCatalog(this.operatingWorkspace)
+		// Flow mode's tools are flowTools, which carry no askUserQuestion.
+		const section = formatAiAgentProvidersPrompt(catalog, { canAskUser: false })
+		// A mode switch or a rebuild since the fetch started owns the message now.
+		if (section === '' || this.systemMessage !== target) {
+			return
+		}
+		this.systemMessage = { ...target, content: `${target.content}\n\n${section}` }
+	}
+
 	// Rebuild the GLOBAL system message in place so an updated user instruction (persisted by
 	// the update_user_instructions tool) is picked up on the next chat-loop iteration, which
 	// re-reads this.systemMessage via a getter.
@@ -2068,6 +2109,7 @@ export class AIChatManager {
 		}
 		const systemMessage = prepareGlobalSystemMessage(getCustomPromptParts(AIMode.GLOBAL), {
 			previewTools: this.isSessionChat,
+			user: this.globalIdentity,
 			skills: this.globalSkills,
 			mcpServers: this.mcpServers
 		})
@@ -2897,10 +2939,13 @@ export class AIChatManager {
 				return false
 			}
 		}
-		// Session chats commit their workspace in beforeSend; skills and MCP servers
-		// must match the committed workspace before the system prompt is sent.
+		// Session chats commit their workspace in beforeSend; the identity, skills and
+		// MCP servers must all match the committed workspace before the system prompt is
+		// sent. Settling them here rather than mid-turn also keeps the prompt — the
+		// cached prefix of every iteration — stable for the whole request.
 		if (this.mode === AIMode.GLOBAL) {
 			await Promise.all([
+				this.refreshGlobalIdentity(this.operatingWorkspace ?? ''),
 				this.refreshGlobalSkills(this.operatingWorkspace ?? ''),
 				this.refreshMcpServers(this.operatingWorkspace ?? '')
 			])

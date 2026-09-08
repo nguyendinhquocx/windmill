@@ -1318,6 +1318,47 @@ async fn create_script_internal<'c>(
         }
     }
 
+    // A retired path keeps its versions, and the newest is where a redeploy belongs: hashed
+    // as a first deploy instead, unchanged content lands on the row the path's own first
+    // version already holds. A deleted version still counts — its row keeps the hash it was
+    // deployed under even once the content is wiped, so skipping it is what collides.
+    //
+    // Any parentless deploy, not only an `auto_parent` one: the CLI names no parent for a
+    // path its listing no longer shows, which is where a retried push lands. Gated on
+    // nothing being live there, so a parentless deploy onto a live path still meets the
+    // path conflict the match below raises.
+    let mut parent_adopted_from_retired_path = false;
+    if ns.parent_hash.is_none() && clashing_script.is_none() {
+        // Locked, not merely read: a competing deploy chaining onto this same candidate
+        // takes `FOR UPDATE` on it before inserting, so holding the row is what serializes
+        // the two. Probe first and the child still uncommitted reads as absent.
+        let candidate = sqlx::query_scalar::<_, i64>(
+            "SELECT hash FROM script WHERE path = $1 AND workspace_id = $2 \
+             ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(&ns.path)
+        .bind(&w_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // Adoptable only if nothing already descends from it: a rename leaves its source
+        // path holding a version whose child lives at the destination, and a second child
+        // forks a lineage the guard below requires to be linear. Nothing adoptable means a
+        // fresh lineage, which has no parent to vary its hash and can still collide.
+        ns.parent_hash = match candidate {
+            Some(hash) => sqlx::query_scalar!(
+                "SELECT 1 FROM script WHERE parent_hashes[1] = $1 AND workspace_id = $2",
+                hash,
+                &w_id
+            )
+            .fetch_optional(&db)
+            .await?
+            .is_none()
+            .then_some(ScriptHash(hash)),
+            None => None,
+        };
+        parent_adopted_from_retired_path = ns.parent_hash.is_some();
+    }
+
     // Must stay below the parent resolution above: an auto_parent deploy hashed before
     // it carries a first deploy's lineage, so redeploying content the path has held
     // before collides with that archived version instead of superseding it. The
@@ -1362,20 +1403,42 @@ async fn create_script_internal<'c>(
                 ));
             };
 
+            // Unscoped, and sound only under the lock above: linearity is a property of the
+            // lineage, not of what this caller may read. A child can sit where they cannot
+            // see it — a folder they renamed it into, or grants an adopting deploy reset —
+            // and asked through `tx` it reads as absent, letting the fork through.
             let clashing_hash_o = sqlx::query_scalar!(
                 "SELECT hash FROM script WHERE parent_hashes[1] = $1 AND workspace_id = $2",
                 p_hash.0,
                 &w_id
             )
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&db)
             .await?;
 
             if let Some(clashing_hash) = clashing_hash_o {
-                return Err(Error::BadRequest(format!(
-                    "A script with hash {} with same parent_hash has been found. However, the \
-                         lineage must be linear: no 2 scripts can have the same parent",
-                    ScriptHash(clashing_hash)
-                )));
+                // Named only when the caller could already read it. The probe above has to be
+                // unscoped to be correct, but a hash alone reads a script's content back
+                // through `raw/h/{hash}`, which authorizes nothing per script — so echoing one
+                // the caller cannot see hands them a way to fetch it.
+                let visible_to_caller = sqlx::query_scalar!(
+                    "SELECT 1 FROM script WHERE hash = $1 AND workspace_id = $2",
+                    clashing_hash,
+                    &w_id
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+                return Err(Error::BadRequest(if visible_to_caller {
+                    format!(
+                        "A script with hash {} with same parent_hash has been found. However, \
+                         the lineage must be linear: no 2 scripts can have the same parent",
+                        ScriptHash(clashing_hash)
+                    )
+                } else {
+                    "A script with the same parent_hash has been found. However, the lineage \
+                     must be linear: no 2 scripts can have the same parent"
+                        .to_owned()
+                }));
             };
 
             let ScriptWithStarred { script: ps, .. } =
@@ -1438,7 +1501,15 @@ async fn create_script_internal<'c>(
                 }
                 Some(_) | None => Ok(Some(ParentInfo {
                     p_hashes: ph,
-                    perms: ps.extra_perms,
+                    // A version adopted above was taken for its lineage, not its grants: a
+                    // retired path may be reused by a different script, which must not start
+                    // life holding an ACL nobody gave it — including one `delete/h` purged.
+                    // A parent the caller named still carries them, as unarchive expects.
+                    perms: if parent_adopted_from_retired_path {
+                        json!({})
+                    } else {
+                        ps.extra_perms
+                    },
                     p_path: ps.path,
                 })),
             };
@@ -2454,27 +2525,28 @@ async fn create_script_internal<'c>(
     // while its own finished runs still render from them. Clearing by path
     // would empty those run pages for good.
     if ns.language != ScriptLang::Dbt {
-        // The saved retry state does go: nothing regenerates it, it is keyed by
-        // path alone, and it carries one user's failed invocation and its
-        // arguments. No dbt version is live at this path any more to resume it.
-        windmill_common::dbt_manifest::clear_dbt_run_state(&mut tx, &w_id, &ns.path).await?;
+        // The saved run and environment state do go: nothing regenerates them,
+        // both are keyed by path alone, and they carry one user's failed
+        // invocation with its arguments and the project's own manifest. No dbt
+        // version is live at this path any more to resume or defer to.
+        windmill_common::dbt_manifest::clear_dbt_script_state(&mut tx, &w_id, &ns.path).await?;
     }
     if let Some(ref old) = p_path_opt {
         if old != &ns.path {
             clear_script_triggers(&mut *tx, &w_id, old, AssetUsageKind::Script).await?;
             clear_static_asset_usage(&mut *tx, &w_id, old, AssetUsageKind::Script).await?;
-            // The saved retry state travels rather than being cleared: nothing
+            // The saved state travels rather than being cleared: nothing
             // regenerates it, so dropping it would throw away a resumable
-            // failure for what is only a rename. Only while the destination is
-            // still dbt — a rename that also converts the language would
-            // otherwise reinstate at the new path the state the branch above
-            // just cleared, leaving one user's arguments and results under a
-            // path no dbt script occupies.
+            // failure and every deferral until the next full run, for what is
+            // only a rename. Only while the destination is still dbt — a rename
+            // that also converts the language would otherwise reinstate at the
+            // new path the state the branch above just cleared, leaving one
+            // user's arguments and results under a path no dbt script occupies.
             if ns.language == ScriptLang::Dbt {
-                windmill_common::dbt_manifest::move_dbt_run_state(&mut tx, &w_id, old, &ns.path)
+                windmill_common::dbt_manifest::move_dbt_script_state(&mut tx, &w_id, old, &ns.path)
                     .await?;
             } else {
-                windmill_common::dbt_manifest::clear_dbt_run_state(&mut tx, &w_id, old).await?;
+                windmill_common::dbt_manifest::clear_dbt_script_state(&mut tx, &w_id, old).await?;
             }
         }
     }
@@ -3712,7 +3784,11 @@ async fn archive_script_by_path(
         path,
         &w_id
     )
-    .fetch_one(&db)
+    // In the SAME transaction as the cleanup below, as the by-hash routes are:
+    // committed on its own, a cleanup that then fails leaves dbt state at a path
+    // no live version occupies, for whatever is created there next to defer
+    // through.
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| Error::internal_err(format!("archiving script in {w_id}: {e:#}")))?;
 
@@ -3720,9 +3796,10 @@ async fn archive_script_by_path(
     // The graph stays: the pinned read resolves versions through a CTE that
     // already skips archived rows, so it stops answering for current relations
     // either way, while deleting it would empty the Models panel of every
-    // completed run of the project. Retry state does go — nothing may resume a
-    // script that is no longer live.
-    windmill_common::dbt_manifest::clear_dbt_run_state(&mut tx, &w_id, path).await?;
+    // completed run of the project. The saved run and environment state do go —
+    // nothing may resume a script that is no longer live, and nothing may defer
+    // through what it last built.
+    windmill_common::dbt_manifest::clear_dbt_script_state(&mut tx, &w_id, path).await?;
     // Pipeline event hygiene: an archived script must not be triggered by
     // anything. Wipe declared `// on ...` edges (asset-event subscribers
     // look these up).
@@ -3807,7 +3884,7 @@ async fn archive_script_by_hash(
     clear_static_asset_usage_by_script_hash(&mut *tx, &w_id, hash).await?;
     // The version's graph stays: its finished runs still render from it, and
     // the live-version CTE already skips archived rows. Deletion clears it.
-    windmill_common::dbt_manifest::clear_dbt_run_state_if_path_retired(
+    windmill_common::dbt_manifest::clear_dbt_script_state_if_path_retired(
         &mut tx,
         &w_id,
         &script.path,
@@ -3870,7 +3947,12 @@ async fn delete_script_by_hash(
     )
     .bind(&hash.0)
     .bind(&w_id)
-    .fetch_one(&db)
+    // In the SAME transaction as the cleanup below, as `archive_script_by_hash`
+    // already does. Committed on its own, it opens a window where the path has
+    // no live version and a concurrent deploy can take it — and the retirement
+    // guard below then finds that new script live, keeps the old project's dbt
+    // state, and leaves the replacement able to defer through its manifest.
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| Error::internal_err(format!("deleting script by hash {w_id}: {e:#}")))?;
 
@@ -3883,7 +3965,7 @@ async fn delete_script_by_hash(
     windmill_common::dbt_manifest::clear_dbt_manifest_version(&mut tx, &w_id, &script.path, hash.0)
         .await?;
     clear_static_asset_usage_by_script_hash(&mut *tx, &w_id, hash).await?;
-    windmill_common::dbt_manifest::clear_dbt_run_state_if_path_retired(
+    windmill_common::dbt_manifest::clear_dbt_script_state_if_path_retired(
         &mut tx,
         &w_id,
         &script.path,
@@ -3984,11 +4066,11 @@ async fn delete_script_by_path(
 
     // After the DELETE, never before: every dbt writer locks the `script` row
     // first, so taking a sidecar ahead of it deadlocks one of the pair. The
-    // VERSIONED graph needs no clear at all, cascading off `script`; the retry
-    // state does, being keyed by path alone and so inherited by whatever is
-    // created here next, and so do the editor's own graphs, whose NULL
+    // VERSIONED graph needs no clear at all, cascading off `script`; the saved
+    // run and environment state do, being keyed by path alone and so inherited
+    // by whatever is created here next, and so do the editor's own graphs, whose NULL
     // `script_hash` satisfies that foreign key without riding its cascade.
-    windmill_common::dbt_manifest::clear_dbt_run_state(&mut tx, &w_id, path).await?;
+    windmill_common::dbt_manifest::clear_dbt_script_state(&mut tx, &w_id, path).await?;
     windmill_common::dbt_manifest::clear_dbt_editor_graphs(&mut tx, &w_id, path).await?;
 
     if !trash_scripts.is_empty() {
@@ -4157,7 +4239,7 @@ async fn delete_scripts_bulk(
     // Same reason as the single-path delete, over every requested path rather
     // than the deleted ones: a path that had no script left can still hold state.
     for p in &request.paths {
-        windmill_common::dbt_manifest::clear_dbt_run_state(&mut tx, &w_id, p).await?;
+        windmill_common::dbt_manifest::clear_dbt_script_state(&mut tx, &w_id, p).await?;
         windmill_common::dbt_manifest::clear_dbt_editor_graphs(&mut tx, &w_id, p).await?;
     }
 

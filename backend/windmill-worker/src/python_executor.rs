@@ -37,8 +37,9 @@ use windmill_common::{
     scripts::ScriptLang,
     utils::calculate_hash,
     worker::{
-        copy_dir_recursively, is_allowed_file_location, pad_string, split_python_requirements,
-        write_file, Connection, PyVAlias, PythonAnnotations, WORKER_CONFIG,
+        copy_dir_recursively, is_allowed_file_location, lockfile_line_has_continuation, pad_string,
+        requirement_from_lockfile_line, split_python_requirements, write_file, Connection,
+        PyVAlias, PythonAnnotations, WORKER_CONFIG,
     },
 };
 
@@ -91,10 +92,10 @@ struct PiptarUploadTask {
 #[cfg(all(feature = "enterprise", feature = "parquet"))]
 async fn handle_piptar_uploads(mut rx: tokio::sync::mpsc::UnboundedReceiver<PiptarUploadTask>) {
     use crate::global_cache::build_tar_and_push;
-    use windmill_object_store::get_object_store;
+    use windmill_object_store::get_cache_object_store;
 
     while let Some(task) = rx.recv().await {
-        if let Some(os) = get_object_store().await {
+        if let Some(os) = get_cache_object_store().await {
             match build_tar_and_push(os, task.venv_path.clone(), task.cache_dir, None, false).await
             {
                 Ok(()) => {
@@ -144,7 +145,7 @@ pub fn has_relative_imports(content: &str) -> bool {
 use crate::global_cache::pull_from_tar;
 
 #[cfg(all(feature = "enterprise", feature = "parquet"))]
-use windmill_object_store::OBJECT_STORE_SETTINGS;
+use windmill_object_store::get_cache_object_store;
 
 use crate::{
     common::{
@@ -227,9 +228,9 @@ fn filter_pip_local_dependencies(lines: Vec<String>) -> (Vec<String>, Vec<String
 /// `(kept, ignored)`. A line is ignored when it is not a `#` comment and matches any of
 /// `compiled_deps`. Kept separate from config/regex loading so it can be unit-tested.
 fn filter_lines_by_deps(lines: Vec<String>, compiled_deps: &[Regex]) -> (Vec<String>, Vec<String>) {
-    let (ignored, kept): (Vec<String>, Vec<String>) = lines
-        .into_iter()
-        .partition(|s| !s.starts_with('#') && compiled_deps.iter().any(|dep| dep.is_match(s)));
+    let (ignored, kept): (Vec<String>, Vec<String>) = lines.into_iter().partition(|s| {
+        !s.trim_start().starts_with('#') && compiled_deps.iter().any(|dep| dep.is_match(s))
+    });
 
     (kept, ignored)
 }
@@ -2449,7 +2450,7 @@ pub async fn handle_python_reqs(
         }
 
         #[cfg(all(feature = "enterprise", feature = "parquet"))]
-        if OBJECT_STORE_SETTINGS.read().await.is_none() {
+        if get_cache_object_store().await.is_none() {
             (s3_pull, s3_push) = (false, false);
         }
 
@@ -2520,11 +2521,23 @@ pub async fn handle_python_reqs(
     // Find out if there is already cached dependencies
     // If so, skip them
     let mut in_cache = vec![];
+    if requirements
+        .iter()
+        .any(|r| lockfile_line_has_continuation(r))
+    {
+        tracing::warn!(workspace_id = %w_id, job_id = %job_id, "lockfile continues entries across lines; the continued lines are dropped");
+        append_logs(
+            job_id,
+            w_id,
+            "\n[!] lockfile continues entries across lines and the continued lines are dropped: `--hash=` pins, extras and markers written that way do not apply\n".to_string(),
+            conn,
+        )
+        .await;
+    }
     for req in &requirements {
-        // Ignore python version annotation backed into lockfile
-        if req.starts_with('#') || req.starts_with('-') || req.trim().is_empty() {
+        let Some(req) = requirement_from_lockfile_line(req) else {
             continue;
-        }
+        };
         let py_prefix = &py_version.to_cache_dir(false);
 
         let venv_p = format!(
@@ -2907,7 +2920,7 @@ pub async fn handle_python_reqs(
 
             #[cfg(all(feature = "enterprise", feature = "parquet"))]
             if is_not_pro {
-                if let Some(os) = windmill_object_store::get_object_store().await {
+                if let Some(os) = windmill_object_store::get_cache_object_store().await {
                     tokio::select! {
                         // Cancel was called on the job
                         _ = kill_rx.recv() => return Err(Error::from(anyhow::anyhow!("S3 pull was canceled"))),

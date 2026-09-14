@@ -106,8 +106,9 @@ use windmill_common::{
 use windmill_common::{
     client::AuthedClient,
     global_settings::{
-        APP_WORKSPACED_ROUTE_SETTING, HTTP_ROUTE_WORKSPACED_ROUTE,
-        HTTP_ROUTE_WORKSPACED_ROUTE_SETTING,
+        parse_allowed_origins_setting, APP_WORKSPACED_ROUTE_SETTING,
+        HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS, HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING,
+        HTTP_ROUTE_WORKSPACED_ROUTE, HTTP_ROUTE_WORKSPACED_ROUTE_SETTING,
     },
     queue_metrics::{
         QueueSample, QUEUE_COUNT_PREFIX, QUEUE_DELAY_PREFIX, QUEUE_DELAY_SAME_HEAD_SECS,
@@ -428,6 +429,18 @@ pub async fn initial_load(
         pass.setting(APP_WORKSPACED_ROUTE_SETTING, false, |v| async move {
             apply_app_workspaced_route_setting(v)
         });
+        pass.setting(
+            HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING,
+            false,
+            |v| async move {
+                if let Err(e) = apply_http_route_default_allowed_origins_setting(v) {
+                    tracing::error!(
+                        "Error reloading http route default allowed origins: {:?}",
+                        e
+                    )
+                }
+            },
+        );
         pass.setting(
             HTTP_ROUTE_WORKSPACED_ROUTE_SETTING,
             false,
@@ -1771,6 +1784,23 @@ pub async fn delete_expired_items(db: &DB) -> () {
         Err(e) => tracing::error!("Error deleting token: {}", e.to_string()),
     }
 
+    let expired_login_links_r: std::result::Result<Vec<String>, _> =
+        // Expired rows stay a day so an open still reports "expired" rather than "invalid".
+        sqlx::query_scalar(
+            "DELETE FROM login_link WHERE expiration <= now() - interval '1 day' RETURNING token_hash",
+        )
+            .fetch_all(db)
+            .await;
+
+    match expired_login_links_r {
+        Ok(hashes) => {
+            if !hashes.is_empty() {
+                tracing::info!("deleted {} expired login links", hashes.len())
+            }
+        }
+        Err(e) => tracing::error!("Error deleting login links: {}", e.to_string()),
+    }
+
     let pip_resolution_r = sqlx::query_scalar!(
         "DELETE FROM pip_resolution_cache WHERE expiration <= now() RETURNING hash",
     )
@@ -1880,6 +1910,17 @@ pub async fn delete_expired_items(db: &DB) -> () {
         delete_expired_otel_traces(db, windmill_common::otel_traces_retention_secs()).await;
     if deleted_spans > 0 {
         tracing::info!("deleted {} expired otel trace spans", deleted_spans);
+    }
+
+    if let Err(e) = sqlx::query!(
+        "DELETE FROM ai_shared_artifact
+         WHERE shared_at <= now() - ($1::bigint::text || ' s')::interval",
+        windmill_common::ai_shared_artifact_retention_secs(),
+    )
+    .execute(db)
+    .await
+    {
+        tracing::error!("Error deleting expired shared AI artifacts: {:?}", e);
     }
 
     let audit_retention_days = audit_log_retention_days().await;
@@ -4698,6 +4739,14 @@ pub async fn poll_git_auto_pull(db: &Pool<Postgres>) {
     {
         tracing::error!("git auto-pull: advisory unlock failed: {e:#}");
     }
+
+    // Backstop for the "Windmill CI tests" checks: retry a failed GitHub create or
+    // delivery, conclude checks whose tests settled, time out stuck ones, prune old
+    // rows. Detached and outside the advisory lock: its writes are guarded (claimed
+    // conclude, greatest-id upsert), it is single-flight, and its GitHub calls must not
+    // count against the monitor pass's budget.
+    let db = db.clone();
+    tokio::spawn(async move { windmill_git_sync::sweep_ci_test_checks(&db).await });
 }
 
 #[cfg(feature = "private")]
@@ -6130,7 +6179,10 @@ async fn handle_zombie_jobs(db: &Pool<Postgres>, base_internal_url: &str, node_n
 /// Force-complete a zombie job that handle_job_error failed to complete.
 /// This is a minimal fallback: it inserts a failed completed job and deletes
 /// from the queue in a single transaction, without schedule pushing or
-/// error handler logic that could cause the completion to fail.
+/// error handler logic. The one thing it keeps is the WAC parent notification,
+/// deliberately inside the transaction: if that fails, the whole completion
+/// rolls back and the job waits for the next sweep, which is cheaper than a
+/// parent parked for its full suspend window and a task run twice.
 async fn force_complete_zombie_job(
     db: &Pool<Postgres>,
     job_id: &Uuid,
@@ -6152,14 +6204,18 @@ async fn force_complete_zombie_job(
         "Zombie job {job_id} was not completed by handle_job_error, force-completing it"
     );
 
+    // Same `{"error": ...}` shape as every other failed job's result, so a WAC
+    // parent's failure record reads the name and message like any task failure.
     let error_value = serde_json::json!({
-        "message": error_message,
-        "name": "ExecutionErr",
+        "error": {
+            "message": error_message,
+            "name": "ExecutionErr",
+        }
     });
 
     let mut tx = db.begin().await?;
 
-    sqlx::query!(
+    let duration_ms = sqlx::query_scalar!(
         "INSERT INTO v2_job_completed
             (workspace_id, id, started_at, duration_ms, result, memory_peak, status, worker)
         SELECT q.workspace_id, q.id, q.started_at,
@@ -6168,18 +6224,49 @@ async fn force_complete_zombie_job(
         FROM v2_job_queue q
         LEFT JOIN v2_job_runtime r ON r.id = q.id
         WHERE q.id = $1
-        ON CONFLICT (id) DO UPDATE SET status = 'failure', result = $2::jsonb",
+        ON CONFLICT (id) DO UPDATE SET status = 'failure', result = $2::jsonb
+        RETURNING duration_ms AS \"duration_ms!\"",
         job_id,
         error_value,
     )
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
+
+    // A WAC parent parked on this job must learn of the failure here too, or it
+    // waits out its whole suspend window and runs the task again.
+    let mut wac_parent_ready = false;
+    if let Some(duration_ms) = duration_ms {
+        let parent = sqlx::query!(
+            "SELECT parent_job, flow_step_id FROM v2_job WHERE id = $1",
+            job_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(parent_job) = parent
+            .filter(|j| j.flow_step_id.is_none())
+            .and_then(|j| j.parent_job)
+        {
+            wac_parent_ready = windmill_common::wac::record_child_completion(
+                &mut tx,
+                &parent_job,
+                job_id,
+                false,
+                duration_ms,
+                &error_value.to_string(),
+            )
+            .await?;
+        }
+    }
 
     sqlx::query!("DELETE FROM v2_job_queue WHERE id = $1", job_id)
         .execute(&mut *tx)
         .await?;
 
     tx.commit().await?;
+
+    if wac_parent_ready {
+        windmill_common::wac::WAC_SUSPEND_READY.store(true, Ordering::Relaxed);
+    }
 
     tracing::info!("Force-completed zombie job {job_id}");
     Ok(())
@@ -7000,6 +7087,34 @@ pub fn apply_app_workspaced_route_setting(app_workspaced_route: Option<serde_jso
     };
 
     APP_WORKSPACED_ROUTE.store(ws_route, Ordering::Relaxed);
+}
+
+pub async fn reload_http_route_default_allowed_origins_setting(conn: &DB) -> error::Result<()> {
+    let v =
+        load_value_from_global_settings(conn, HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING).await?;
+    apply_http_route_default_allowed_origins_setting(v)
+}
+
+pub fn apply_http_route_default_allowed_origins_setting(
+    value: Option<serde_json::Value>,
+) -> error::Result<()> {
+    // A bad value leaves whatever is already loaded in place rather than
+    // reverting to no restriction. On the boot path that is still the empty
+    // default, so what keeps a stored typo from widening CORS instance-wide is
+    // write-time validation, not this.
+    let origins = match parse_allowed_origins_setting(value.as_ref()) {
+        Ok(origins) => origins,
+        Err(err) => {
+            tracing::error!(
+                "Invalid {} setting, keeping the previous value: {err:#}",
+                HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS_SETTING
+            );
+            return Ok(());
+        }
+    };
+
+    HTTP_ROUTE_DEFAULT_ALLOWED_ORIGINS.store(std::sync::Arc::new(origins));
+    Ok(())
 }
 
 pub async fn reload_http_route_workspaced_route_setting(conn: &DB) -> error::Result<()> {

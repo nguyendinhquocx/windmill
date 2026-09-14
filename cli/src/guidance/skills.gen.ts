@@ -5907,6 +5907,19 @@ An app can be demoed by recording a session: every interaction becomes a step ca
 
 Apply it to customer data, internal notes and anything else a viewer of the demo should not see. It costs nothing when the app is never recorded.
 
+### Chat UIs over a flow in chat mode
+
+A flow deployed with chat mode on is a chat backend (streaming answer, tool calls, memory, conversation history). Do not drive it through a runnable: add \`windmill-chat\` to \`package.json\` and use it directly, it detects the app's Windmill and credential.
+
+\`\`\`tsx
+import { useWindmillChat } from 'windmill-chat/react'
+
+const chat = useWindmillChat({ flowPath: 'f/support/assistant' })
+// chat.messages ({ role, content, pending, success, tool? }), chat.status, chat.sendMessage(text), chat.stop()
+\`\`\`
+
+\`windmill-chat/ai-sdk\` gives a \`ChatTransport\` for the Vercel AI SDK's \`useChat\`, \`windmill-chat/assistant-ui\` a runtime for assistant-ui. The flow must be deployed, not a draft. A sandboxed app needs \`jobs:run\` in its frontend SDK scopes, plus \`flow_conversations:write\` for the conversation sidebar; without them the chat keeps history in the browser.
+
 ## Backend runnables
 
 Each runnable has a unique key (used to call it from the frontend) and one of four types:
@@ -6035,6 +6048,7 @@ def main(user_id: str):
 6. **Mark sensitive UI with \`data-wm-no-record\`** — it is what keeps that data out of a recorded demo; passwords are handled for you.
 7. **Reach for \`backendAsync\` + \`waitJob\`** for long work — never a hand-written job-polling runnable.
 8. **Deploy what a path runnable points at** — a path runnable aimed at a draft fails at runtime; tell the user what needs deploying.
+9. **Use \`windmill-chat\` for a chat over a chat-mode flow** — never a runnable that runs the flow and polls its stream.
 `,
   "triggers": `---
 name: triggers
@@ -7720,6 +7734,27 @@ Manage API tokens
   - \`--expiration <expiration:string>\` - Token expiration (ISO 8601 timestamp)
 - \`token delete <token_prefix:string>\` - Delete a token by its prefix
 
+### trash
+
+List, inspect and restore items deleted in the last three days (requires admin)
+
+**Options:**
+- \`--json\` - Output as JSON (for piping to jq)
+- \`--kind <kind:string>\` - Only items of this kind: script, flow, app, schedule, variable, resource or a trigger kind such as http_trigger
+- \`--limit <limit:integer>\` - Number of items to return (default 100, max 1000)
+- \`--page <page:integer>\` - Page to return, starting at 1
+
+**Subcommands:**
+
+- \`trash list\` - List trashed items, most recently deleted first
+  - \`--json\` - Output as JSON (for piping to jq)
+  - \`--kind <kind:string>\` - Only items of this kind: script, flow, app, schedule, variable, resource or a trigger kind such as http_trigger
+  - \`--limit <limit:integer>\` - Number of items to return (default 100, max 1000)
+  - \`--page <page:integer>\` - Page to return, starting at 1
+- \`trash get <id:integer>\` - Show a trashed item and the data it was deleted with
+  - \`--json\` - Output as JSON (for piping to jq)
+- \`trash restore <ids...:integer>\` - Put trashed items back at their paths
+
 ### trigger
 
 trigger related commands
@@ -8525,6 +8560,21 @@ properties:
     type: boolean
     description: If true, passes the request body as a raw string instead of parsing
       as JSON
+  allowed_origins:
+    type: array
+    items:
+      type: string
+    description: 'Origins allowed to call this route cross-origin, matched against
+      the request''s Origin header (ignoring case) and echoed back on a match. When
+      set, the list governs both the preflight and the response, overriding any Access-Control-Allow-Origin
+      the runnable returns via wm_headers. Use [''*''] to opt out of any restriction,
+      including the http_route_default_allowed_origins instance setting. An empty
+      list is not a configuration and resolves exactly as null does. When null, the
+      instance setting applies, or Access-Control-Allow-Origin: * if it is unset.
+      Ignored on a static website, which has no authentication of its own and so hands
+      out public files: restricting which browsers may read them protects nothing
+      while breaking cross-origin webfonts and fetches. A single-file static asset
+      is not exempt, since it can carry an authentication_method.'
   error_handler_path:
     type: string
     description: Path to a script to run when the triggered job fails. A bare path,

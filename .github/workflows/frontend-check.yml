@@ -9,8 +9,6 @@ on:
   push:
     paths:
       - "frontend/**"
-      # The flow chat compiles the chat SDK's source in (svelte.config.js alias).
-      - "chat-sdk/src/**"
       - ".github/workflows/frontend-check.yml"
 
 jobs:

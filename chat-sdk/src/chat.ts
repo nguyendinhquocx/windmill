@@ -1,6 +1,7 @@
 import {
   WindmillApiError,
   WindmillChatApi,
+  type ConversationKind,
   type FlowConversation,
   type FlowConversationMessage
 } from './api'
@@ -18,6 +19,7 @@ import type {
 } from './types'
 import {
   conversationTitle,
+  truncateTitle,
   errorResultMessage,
   extractChatAnswer,
   isAbortError,
@@ -59,6 +61,8 @@ class ChatImpl implements Chat {
   #state: ChatState
   #turn: Turn | undefined
   #page = 1
+  /** The kind the caller last listed, so the refresh after a new turn lists the same rows. */
+  #conversationKind: ConversationKind | undefined
   #persistTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(options: ChatOptions) {
@@ -229,15 +233,21 @@ class ChatImpl implements Chat {
   }
 
   loadConversations = async (
-    options: { page?: number; perPage?: number } = {}
+    options: { page?: number; perPage?: number; kind?: ConversationKind } = {}
   ): Promise<Conversation[]> => {
     const page = options.page ?? 1
+    // A different kind is a different listing: its first rows replace the held ones, on
+    // whichever page they were asked for.
+    const kindChanged = 'kind' in options && options.kind !== this.#conversationKind
+    if ('kind' in options) this.#conversationKind = options.kind
+    const kind = this.#conversationKind
     let conversations: Conversation[]
     if (this.#state.history === 'server') {
       try {
         const rows = await this.#api.listConversations(this.#config.flowPath, {
           page,
-          perPage: options.perPage ?? this.#config.pageSize
+          perPage: options.perPage ?? this.#config.pageSize,
+          kind
         })
         conversations = rows.map(fromConversation)
       } catch (e) {
@@ -247,10 +257,13 @@ class ChatImpl implements Chat {
     } else {
       conversations = this.#state.history === 'local' ? this.#local.listConversations() : []
     }
+    // Another kind was asked for while this list was on its way: its rows are not the
+    // listing any more, whichever response lands last.
+    if (kind !== this.#conversationKind) return conversations
     const known = new Set(this.#state.conversations.map((c) => c.id))
     this.#set({
       conversations:
-        page === 1
+        page === 1 || kindChanged
           ? conversations
           : [...this.#state.conversations, ...conversations.filter((c) => !known.has(c.id))]
     })
@@ -271,6 +284,24 @@ class ChatImpl implements Chat {
       this.#local.deleteConversation(conversationId)
     }
     this.#set({ conversations: this.#state.conversations.filter((c) => c.id !== conversationId) })
+  }
+
+  renameConversation = async (conversationId: string, title: string): Promise<void> => {
+    // Cut here as the server cuts, so the title shown is the one stored.
+    const trimmed = truncateTitle(title.trim())
+    if (!trimmed) return
+    if (this.#state.history === 'server') {
+      await this.#api.renameConversation(conversationId, trimmed)
+    } else if (this.#state.history === 'local') {
+      this.#local.renameConversation(conversationId, trimmed)
+    }
+    // Patched in place: the server keeps `updated_at` on a rename, so the list order the
+    // next load returns is the one shown now.
+    this.#set({
+      conversations: this.#state.conversations.map((c) =>
+        c.id === conversationId ? { ...c, title: trimmed } : c
+      )
+    })
   }
 
   loadOlderMessages = async (): Promise<void> => {
@@ -344,16 +375,21 @@ class ChatImpl implements Chat {
           tool: { ...existing.tool!, ...toolPatch }
         }
       } else {
+        // Thinking that produced no text led to this call, and is stored on its row.
+        const a = turn.assistantId ? messages.findIndex((m) => m.id === turn.assistantId) : -1
+        const reasoning = a >= 0 && messages[a].content === '' ? messages.splice(a, 1)[0].reasoning : undefined
         messages.push({
           id: `pending-${randomId()}`,
           role: 'tool',
           content: content ?? '',
+          reasoning,
           success: success ?? true,
           createdAt: now(),
           pending: true,
           tool: { callId, name, status: 'running', ...toolPatch }
         })
       }
+      turn.assistantId = undefined
     }
     const appendAssistant = (text: string, reasoning: string) => {
       const i = turn.assistantId
@@ -388,17 +424,14 @@ class ChatImpl implements Chat {
         case 'reasoning_token_delta':
           appendAssistant('', event.content)
           break
+        // A call completes the round's text: text after it is a new message.
         case 'tool_call':
-          // The round's text is complete; text after the tool result is a new message.
-          turn.assistantId = undefined
           upsertTool(event.call_id, event.function_name, { status: 'running' })
           break
         case 'tool_call_arguments':
-          turn.assistantId = undefined
           upsertTool(event.call_id, event.function_name, { arguments: event.arguments })
           break
         case 'tool_execution':
-          turn.assistantId = undefined
           upsertTool(event.call_id, event.function_name, { status: 'running' })
           break
         case 'tool_result':
@@ -612,22 +645,54 @@ class ChatImpl implements Chat {
     for (const row of rows.map(fromRow)) {
       if (known.has(row.id)) continue
       known.add(row.id)
-      const i = messages.findIndex(
+      let i = messages.findIndex(
         (m) =>
           m.seq === undefined &&
           m.role === row.role &&
           (m.content === row.content || (row.tool !== undefined && m.tool?.name === row.tool.name))
       )
+      // A structured answer streams as the call of the structured-output tool, whose
+      // arguments are the answer's text: its row replaces that call. Only past the newest
+      // user message, where a stopped turn's identical call cannot be.
+      if (i < 0 && row.role === 'assistant') {
+        let j = messages.length - 1
+        while (j >= 0 && messages[j].role !== 'user') {
+          const m = messages[j]
+          if (m.seq === undefined && m.role === 'tool' && m.tool?.arguments === row.content) i = j
+          j--
+        }
+      }
       if (i >= 0) {
         const m = messages[i]
         messages[i] = {
           ...row,
           id: m.id,
           reasoning: m.reasoning ?? row.reasoning,
-          tool: m.tool ? { ...m.tool, status: row.tool?.status ?? m.tool.status } : row.tool
+          // The stream's call wins where it has a value; a stream cut short leaves gaps the row fills.
+          tool:
+            row.role === 'tool' && m.tool
+              ? {
+                  ...m.tool,
+                  arguments: m.tool.arguments ?? row.tool?.arguments,
+                  result: m.tool.result ?? row.tool?.result,
+                  status: row.tool?.status ?? m.tool.status
+                }
+              : row.tool
         }
       } else {
-        messages.push(row)
+        // A tool row nothing streamed, such as a provider-native web search, goes where a
+        // reload puts it: after the last message of a lower `seq`, before the streamed answer.
+        // Any other row closes the turn, a failure included, and stays last: above a streamed
+        // message that never got a row, it would hide the turn's failure.
+        let at = messages.length
+        for (let j = messages.length - 1; row.role === 'tool' && j >= 0; j--) {
+          const seq = messages[j].seq
+          if (seq !== undefined && seq < row.seq!) {
+            at = j + 1
+            break
+          }
+        }
+        messages.splice(at, 0, row)
       }
     }
     this.#set({ messages })
@@ -725,7 +790,19 @@ function fromRow(row: FlowConversationMessage): ChatMessage {
     stepName: row.step_name ?? undefined,
     pending: false,
     seq: row.created_seq,
-    tool: toolName ? { name: toolName, status: success ? 'success' : 'error' } : undefined
+    reasoning: row.reasoning ?? undefined,
+    attachments: row.attachments ?? undefined,
+    // The call the row carries: the model's arguments and what the model got back. For a
+    // failed tool the result is what it failed with, and the row's text names the tool
+    // rather than the reason.
+    tool: toolName
+      ? {
+          name: toolName,
+          status: success ? 'success' : 'error',
+          arguments: row.tool_arguments ?? undefined,
+          result: row.tool_result ?? undefined
+        }
+      : undefined
   }
 }
 
@@ -734,7 +811,8 @@ function fromConversation(row: FlowConversation): Conversation {
     id: row.id,
     title: row.title ?? undefined,
     createdAt: row.created_at,
-    updatedAt: row.updated_at
+    updatedAt: row.updated_at,
+    isTest: row.is_test
   }
 }
 

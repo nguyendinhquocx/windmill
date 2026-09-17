@@ -5,6 +5,7 @@ export {
   WindmillApiError,
   readServerSentEvents,
   type WindmillChatApiOptions,
+  type ConversationKind,
   type FlowConversation,
   type FlowConversationMessage,
   type JobUpdateEvent,
@@ -15,6 +16,7 @@ export { followJob, type FollowEvent } from './follow'
 export { extractChatAnswer, conversationIdFor } from './utils'
 export type {
   Chat,
+  ChatAttachment,
   ChatMessage,
   ChatOptions,
   ChatRole,

@@ -26,19 +26,23 @@ export interface ToolInvocation {
   status: 'running' | 'success' | 'error'
 }
 
+export interface ChatAttachment { input: string; s3: string; storage?: string; filename?: string }
+
 export interface ChatMessage {
   id: string
   role: ChatRole
   content: string
   /** The model's reasoning summary, when the provider streams one. */
   reasoning?: string
-  /** Set on `tool` messages that came from the live stream. */
+  /** The call on a `tool` message, from the live stream or its stored row; `callId` is only known from the stream. */
   tool?: ToolInvocation
   success: boolean
   createdAt: string
   jobId?: string
   /** The flow step that produced the message. */
   stepName?: string
+  /** The files a user message carried, as object-storage references. */
+  attachments?: ChatAttachment[]
   /** True while the message is optimistic or still streaming. */
   pending: boolean
   /** Id of the persisted row once the server has it; `id` itself never changes, so list keys stay stable. */
@@ -52,6 +56,11 @@ export interface Conversation {
   title: string | undefined
   createdAt: string
   updatedAt: string
+  /**
+   * Started from the flow editor's test panel rather than a deployed run. Known once the
+   * server has listed the conversation; unset for one only this client has seen.
+   */
+  isTest?: boolean
 }
 
 export interface ChatState {
@@ -128,8 +137,18 @@ export interface Chat {
   stop(): Promise<void>
   newConversation(): void
   selectConversation(conversationId: string): Promise<void>
-  loadConversations(options?: { page?: number; perPage?: number }): Promise<Conversation[]>
+  /**
+   * `kind` narrows server history to the flow editor's test chats, the deployed flow's
+   * own (the server's default), or both. Local history has no test chats and ignores it.
+   */
+  loadConversations(options?: {
+    page?: number
+    perPage?: number
+    kind?: 'test' | 'deployed' | 'all'
+  }): Promise<Conversation[]>
   deleteConversation(conversationId: string): Promise<void>
+  /** Sets a conversation's title. The list keeps its order: only a turn moves a conversation. */
+  renameConversation(conversationId: string, title: string): Promise<void>
   loadOlderMessages(): Promise<void>
   /** Stops background work (stream, polling) and writes local history out. The chat stays usable. */
   destroy(): void

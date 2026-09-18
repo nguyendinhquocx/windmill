@@ -139,8 +139,8 @@
 	let isCollapsed = $state(collapsePref.val)
 
 	// Resizable desktop rail, sized in REM so it scales with the root font-size the
-	// same way the old `w-52`/`w-12` classes did — `:root` jumps to 18px past 1760px
-	// wide (app.css), which grows the rem-based button content; a fixed-px rail would
+	// same way the old `w-52`/`w-12` classes did — `:root` jumps to 18px on screens
+	// ≥1760px (app.css), which grows the rem-based button content; a fixed-px rail would
 	// not grow with it and the content would overflow. SIDEBAR_MIN_REM is the default
 	// expanded width (the old w-52); the handle only resizes when expanded and only
 	// widens from there — collapsing is the toggle button's job, not the drag's.
@@ -1414,11 +1414,11 @@
 			</div>
 		{/if}
 		<div class="flex flex-col h-full w-full">
-			{#if isCloudHosted() && !menuHidden}
-				<!-- Announcements are a managed-cloud operations tool, so the component never
-				     mounts elsewhere: no fetch, no poll, no listener on a self-hosted instance.
-				     Also skipped when the menu is hidden — that is an embed or an OAuth
-				     callback, where the announcement would land inside someone else's page. -->
+			{#if $enterpriseLicense && !menuHidden}
+				<!-- Announcements are an EE feature, so the component never mounts on CE: no
+				     fetch, no poll, no listener there. Also skipped when the menu is hidden —
+				     that is an embed or an OAuth callback, where the announcement would land
+				     inside someone else's page. -->
 				<InstanceBanner />
 			{/if}
 			{#if $userStore?.is_service_account}

@@ -3434,6 +3434,9 @@ datatable related commands
     - \`-d --datatable <datatable:string>\` - Target datatable (default: main)
   - \`datatable migrate down\` - roll back the most recent migration on the main datatable (or one via --datatable)
     - \`-d --datatable <datatable:string>\` - Target datatable (default: main)
+  - \`datatable migrate status\` - show applied and pending migrations on the main datatable (or one via --datatable)
+    - \`-d --datatable <datatable:string>\` - Target datatable (default: main)
+    - \`--json\` - Output as JSON (for piping to jq)
 - \`datatable create [name:string]\` - register a datatable database in the workspace (default: instance-backed 'main') so scripts can use datatable://<name>
   - \`--resource <resource:string>\` - Back the datatable with an existing postgresql resource path instead of the instance database
   - \`--force\` - Allow adding to a workspace that already has datatables (fork metadata on existing ones is not preserved)
@@ -4544,6 +4547,18 @@ Only use resource types if you need them to satisfy the instructions. Always use
 export async function main(url: string) {
   const response = await fetch(url);
   return await response.json();
+}
+\`\`\`
+
+## Pure computation: \`//no_network\`
+
+A native script that only transforms its inputs can declare \`//no_network\` in its leading comment block (right after \`//native\`). The runtime then refuses every connection the script attempts: \`fetch\` to any host, the Windmill API (so \`windmill-client\` calls fail too), raw sockets and unix sockets, and \`WM_TOKEN\` is not set. It only takes effect on native scripts: without \`//native\` it is ignored. Use it only when the script needs no external data beyond its arguments:
+
+\`\`\`typescript
+//native
+//no_network
+export async function main(items: { price: number; qty: number }[]) {
+  return items.reduce((sum, i) => sum + i.price * i.qty, 0);
 }
 \`\`\`
 

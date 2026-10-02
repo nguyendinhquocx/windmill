@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +13,7 @@ use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde_json::value::RawValue;
 use serde_json::Map;
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio_postgres::Client;
 use tokio_postgres::{types::ToSql, Row};
 use tokio_postgres::{
@@ -55,16 +54,266 @@ use windmill_common::client::AuthedClient;
 use windmill_types::s3::S3Object;
 
 lazy_static! {
-    pub static ref CONNECTION_CACHE: Arc<Mutex<Option<(String, tokio_postgres::Client)>>> =
-        Arc::new(Mutex::new(None));
     pub static ref CONNECTION_COUNTER: Arc<RwLock<HashMap<String, u64>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    pub static ref LAST_QUERY: AtomicU64 = AtomicU64::new(0);
     pub static ref CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 }
 
+/// How far a job's statements have got, read by its stall warning.
+struct PgProgress {
+    start: std::time::Instant,
+    statement: AtomicUsize,
+    rows: AtomicU64,
+    last_progress_ms: AtomicU64,
+}
+
+impl PgProgress {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            statement: AtomicUsize::new(0),
+            rows: AtomicU64::new(0),
+            last_progress_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    fn start_statement(&self, index: usize) {
+        self.statement.store(index, Ordering::Relaxed);
+        self.last_progress_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn row(&self) {
+        self.rows.fetch_add(1, Ordering::Relaxed);
+        self.last_progress_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn rows(&self) -> u64 {
+        self.rows.load(Ordering::Relaxed)
+    }
+}
+
+const PG_STALL_WARNING_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Steps faster than this are not logged: a log line is a write to the main DB,
+/// and a script split into many statements would pay one per statement.
+const PG_SLOW_STEP: Duration = Duration::from_secs(1);
+
+fn connection_kind(fresh_connection: bool) -> &'static str {
+    if fresh_connection {
+        "new connection"
+    } else {
+        "worker's cached connection"
+    }
+}
+
+/// Warns once per stall in the job log; never completes. A statement still
+/// computing its first row also trips it, which is why it only warns: the job
+/// timeout stays the one thing that stops a job.
+async fn warn_on_stalled_statement(
+    progress: &PgProgress,
+    statement_count: usize,
+    fresh_connection: bool,
+    job_id: Uuid,
+    workspace_id: &str,
+    conn: &Connection,
+) -> std::convert::Infallible {
+    let mut warned_for = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let last = progress.last_progress_ms.load(Ordering::Relaxed);
+        let stalled = Duration::from_millis(progress.elapsed_ms().saturating_sub(last));
+        if stalled < PG_STALL_WARNING_AFTER || warned_for == Some(last) {
+            continue;
+        }
+        warned_for = Some(last);
+        windmill_queue::append_logs(
+            &job_id,
+            workspace_id,
+            format!(
+                "No new row for {} min on statement {}/{statement_count} ({} rows so far, {}). \
+                 A query still running on the database is normal; if the database shows no \
+                 active query for this connection, the job is stuck in the worker.\n",
+                stalled.as_secs() / 60,
+                progress.statement.load(Ordering::Relaxed) + 1,
+                progress.rows(),
+                connection_kind(fresh_connection),
+            ),
+            conn,
+        )
+        .await;
+    }
+}
+
+/// One reusable connection per worker process, checked out by a job for the
+/// duration of its query and checked back in afterwards.
+///
+/// Invariant: the process never keeps an idle connection while one of its jobs
+/// runs on a connection of its own. Behind a session-mode pooler (PgBouncer,
+/// RDS Proxy pinning, …) the idle connection holds a server slot, and the job
+/// on its own connection waits for that slot with no timeout, forever if the
+/// idle connection keeps being reused by other jobs.
+static PG_CONNECTION_CACHE: std::sync::Mutex<PgConnectionCache> =
+    std::sync::Mutex::new(PgConnectionCache { idle: None, checked_out: false, uncached: 0 });
+static PG_CONNECTION_CACHE_SWEEPER: std::sync::Once = std::sync::Once::new();
+const PG_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct PgConnectionCache {
+    idle: Option<PgConnection>,
+    /// The cached connection is out with a running job.
+    checked_out: bool,
+    /// Jobs of this process running on a connection that is not the cached one.
+    uncached: usize,
+}
+
+fn pg_connection_cache() -> std::sync::MutexGuard<'static, PgConnectionCache> {
+    PG_CONNECTION_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+struct PgConnection {
+    key: String,
+    client: Client,
+    connection_task: tokio::task::JoinHandle<()>,
+    last_used: std::time::Instant,
+}
+
+impl Drop for PgConnection {
+    fn drop(&mut self) {
+        self.connection_task.abort();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PgLeaseSlot {
+    CheckedOut,
+    Uncached,
+}
+
+/// A job's claim on a connection. Dropping it checks the connection back in,
+/// or closes it when keeping it would break the cache invariant.
+struct PgConnectionLease {
+    slot: PgLeaseSlot,
+    conn: Option<PgConnection>,
+    /// Cache this job's own connection on release.
+    cache_on_release: bool,
+}
+
+impl PgConnectionLease {
+    /// Takes the cached connection when it matches `key`. Otherwise registers
+    /// the job as uncached and closes the idle connection, whatever its key, so
+    /// it cannot hold the server slot the job's own connection is about to need.
+    fn checkout(key: &str) -> Self {
+        let (lease, evicted) = {
+            let mut cache = pg_connection_cache();
+            match cache.idle.take() {
+                Some(conn) if conn.key == key => {
+                    cache.checked_out = true;
+                    (Self::new(PgLeaseSlot::CheckedOut, Some(conn)), None)
+                }
+                other => {
+                    cache.uncached += 1;
+                    (Self::new(PgLeaseSlot::Uncached, None), other)
+                }
+            }
+        };
+        drop(evicted);
+        lease
+    }
+
+    fn uncached() -> Self {
+        pg_connection_cache().uncached += 1;
+        Self::new(PgLeaseSlot::Uncached, None)
+    }
+
+    fn new(slot: PgLeaseSlot, conn: Option<PgConnection>) -> Self {
+        Self { slot, conn, cache_on_release: false }
+    }
+
+    /// Gives up a cached connection that failed its probe; the job then
+    /// connects on its own.
+    fn discard(&mut self) {
+        let conn = self.conn.take();
+        if self.slot == PgLeaseSlot::CheckedOut {
+            let mut cache = pg_connection_cache();
+            cache.checked_out = false;
+            cache.uncached += 1;
+            self.slot = PgLeaseSlot::Uncached;
+        }
+        drop(conn);
+    }
+
+    fn client(&self) -> &Client {
+        &self.conn.as_ref().expect("lease holds a connection").client
+    }
+}
+
+impl Drop for PgConnectionLease {
+    fn drop(&mut self) {
+        let Some(mut conn) = self.conn.take() else {
+            if self.slot == PgLeaseSlot::Uncached {
+                pg_connection_cache().uncached -= 1;
+            }
+            return;
+        };
+        let kept = {
+            let mut cache = pg_connection_cache();
+            let wants_cache = match self.slot {
+                PgLeaseSlot::CheckedOut => {
+                    cache.checked_out = false;
+                    true
+                }
+                PgLeaseSlot::Uncached => {
+                    cache.uncached -= 1;
+                    self.cache_on_release
+                }
+            };
+            if wants_cache && cache.uncached == 0 && !cache.checked_out && cache.idle.is_none() {
+                conn.last_used = std::time::Instant::now();
+                cache.idle = Some(conn);
+                None
+            } else {
+                Some(conn)
+            }
+        };
+        match kept {
+            None => PG_CONNECTION_CACHE_SWEEPER.call_once(|| {
+                tokio::spawn(sweep_idle_pg_connection());
+            }),
+            Some(conn) => drop(conn),
+        }
+    }
+}
+
+async fn sweep_idle_pg_connection() {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let expired = {
+            let mut cache = pg_connection_cache();
+            if cache
+                .idle
+                .as_ref()
+                .is_some_and(|c| c.last_used.elapsed() > PG_CONNECTION_IDLE_TIMEOUT)
+            {
+                cache.idle.take()
+            } else {
+                None
+            }
+        };
+        if expired.is_some() {
+            tracing::info!("Closing cache pg executor connection due to inactivity");
+        }
+    }
+}
+
 pub async fn clear_pg_cache() {
-    *CONNECTION_CACHE.lock().await = None;
+    let idle = pg_connection_cache().idle.take();
+    drop(idle);
     CONNECTION_COUNTER.write().await.clear();
 }
 
@@ -159,8 +408,6 @@ async fn new_pg_connection(
     };
     let handle = tokio::spawn(async move {
         if let Err(e) = connection.await {
-            let mut mtex = CONNECTION_CACHE.lock().await;
-            *mtex = None;
             tracing::error!("connection error: {}", e);
         }
     });
@@ -362,6 +609,79 @@ fn wrap_param_encoding_error(
     to_anyhow(err).into()
 }
 
+/// Whether a statement may return a row stream, and so needs its column types described
+/// before it runs. Anything not recognised as returning at most a row counts as a stream:
+/// a wrong guess only costs a round trip, while a missed stream can hang the job.
+fn can_stream_rows(query: &str) -> bool {
+    let Some(keyword) = leading_keyword(query) else {
+        return true;
+    };
+    let rowless = matches!(
+        keyword.as_str(),
+        "insert"
+            | "update"
+            | "delete"
+            | "merge"
+            | "create"
+            | "alter"
+            | "drop"
+            | "truncate"
+            | "grant"
+            | "revoke"
+            | "comment"
+            | "set"
+            | "reset"
+            | "call"
+            | "do"
+            | "begin"
+            | "commit"
+            | "rollback"
+            | "lock"
+            | "vacuum"
+            | "analyze"
+            | "refresh"
+    );
+    !rowless || query.to_ascii_lowercase().contains("returning")
+}
+
+/// The first keyword of a statement, past whitespace and comments, following Postgres's
+/// scanner: a `--` comment ends at CR or LF, and block comments nest, so
+/// `/* /* a */ INSERT */ SELECT` starts with SELECT. `None` when the comments never end.
+fn leading_keyword(query: &str) -> Option<String> {
+    let mut rest = query;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = &after[after.find(['\n', '\r'])?..];
+        } else if rest.starts_with("/*") {
+            let mut depth = 0usize;
+            let mut i = 0;
+            let bytes = rest.as_bytes();
+            loop {
+                match bytes.get(i..i + 2)? {
+                    b"/*" => depth += 1,
+                    b"*/" => depth -= 1,
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+                i += 2;
+                if depth == 0 {
+                    break;
+                }
+            }
+            rest = &rest[i..];
+        } else {
+            break;
+        }
+    }
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_ascii_lowercase())
+}
+
 fn otyp_to_pg_type(otyp: &str) -> error::Result<Type> {
     let base = otyp.trim_end_matches("[]");
     let is_array = otyp.ends_with("[]");
@@ -411,6 +731,7 @@ fn do_postgresql_inner<'a>(
     workspace_id: &'a str,
     log_conn: &'a Connection,
     raw_output: bool,
+    progress: &'a PgProgress,
 ) -> error::Result<BoxFuture<'a, error::Result<Vec<Box<RawValue>>>>> {
     let mut query_params = vec![];
     let mut param_types: Vec<Type> = vec![];
@@ -510,15 +831,25 @@ fn do_postgresql_inner<'a>(
     let result_f = async move {
         let mut res: Vec<Box<serde_json::value::RawValue>> = vec![];
 
-        // Always prefer query_typed_raw (unnamed prepared statement). It is sent as
-        // a single Parse+Bind+Execute+Sync round-trip, so it survives transaction-mode
-        // connection poolers (PgBouncer/Supabase pooler/RDS Proxy) where named
+        // Always prefer query_typed_raw (unnamed prepared statement). It and its
+        // describe are each a self-contained round-trip ending in Sync, so they
+        // survive transaction-mode connection poolers (PgBouncer/Supabase
+        // pooler/RDS Proxy) where named
         // statements ("s0", "s1", ...) can be reported missing because the prepare
         // and the execute land on different backend connections. Fall back to
         // prepare + query_raw only when an arg has a type unsupported by
         // otyp_to_pg_type (e.g. custom enum, geometry, …) — in that case we lose
         // pooler safety, but the query at least runs against a direct connection.
         let rows = if all_types_resolved {
+            // query_typed_raw looks up result column types this connection has not seen
+            // (enums, domains, extension types) while the rows already stream, and on a
+            // large result that lookup waits behind them forever. Describing first resolves
+            // them up front, still without a named statement.
+            if can_stream_rows(&query) {
+                if let Err(e) = client.describe_typed(&query, &param_types).await {
+                    return Err(wrap_param_encoding_error(e, &param_meta, &param_types));
+                }
+            }
             let typed_params = query_params
                 .iter()
                 .zip(param_types.iter())
@@ -551,10 +882,13 @@ fn do_postgresql_inner<'a>(
 
         if skip_collect {
             futures::pin_mut!(rows);
-            while rows.try_next().await.map_err(to_anyhow)?.is_some() {}
+            while rows.try_next().await.map_err(to_anyhow)?.is_some() {
+                progress.row();
+            }
         } else if let Some(ref s3) = s3 {
             let format_state_ref = &format_state;
             let rows_stream = rows.map_err(to_anyhow).map(move |row_result| {
+                progress.row();
                 row_result.and_then(|row| {
                     postgres_row_to_json_value_with_state(row, format_state_ref).map_err(to_anyhow)
                 })
@@ -592,6 +926,7 @@ fn do_postgresql_inner<'a>(
             let mut column_names: Option<Vec<String>> = None;
 
             while let Some(row) = rows.try_next().await.map_err(to_anyhow)? {
+                progress.row();
                 if column_names.is_none() {
                     column_names = Some(
                         row.columns()
@@ -786,97 +1121,107 @@ pub async fn do_postgresql(
         database.to_uri(),
         auth_mode.cache_key_segment()
     );
-    let database_string_clone = database_string.clone();
 
-    let cached_client;
-    let new_client;
-    if !*CLOUD_HOSTED {
-        let mut guard = CONNECTION_CACHE.try_lock().ok();
+    let connect_started = std::time::Instant::now();
+    let mut cached_connection_failed_reset = false;
+    let mut lease = if *CLOUD_HOSTED {
+        PgConnectionLease::uncached()
+    } else {
         increment_connection_counter(&database_string).await;
+        PgConnectionLease::checkout(&database_string)
+    };
 
-        if guard
-            .as_ref()
-            .is_some_and(|x| x.as_ref().is_some_and(|y| y.0 == database_string))
-        {
-            // Probe the cached connection with a curated session reset before
-            // reusing it. Each statement targets a specific class of state:
-            //
-            //   RESET ALL                     — GUC parameters (search_path,
-            //                                   application_name, statement_
-            //                                   timeout, transaction_*…). Note
-            //                                   that this does NOT reset SET
-            //                                   ROLE or SET SESSION
-            //                                   AUTHORIZATION (security!).
-            //   RESET SESSION AUTHORIZATION   — undoes both `SET SESSION
-            //                                   AUTHORIZATION` and `SET ROLE`,
-            //                                   restoring the connecting user.
-            //                                   Without this a previous job
-            //                                   leaving an elevated role
-            //                                   active would silently leak
-            //                                   permissions into the next.
-            //   UNLISTEN *                    — drops LISTEN registrations.
-            //   CLOSE ALL                     — closes open cursors.
-            //   pg_advisory_unlock_all()      — releases any session-scoped
-            //                                   advisory locks. Without this
-            //                                   a job that called
-            //                                   pg_advisory_lock and exited
-            //                                   without unlocking would block
-            //                                   later jobs holding the same
-            //                                   key (DISCARD ALL covered this
-            //                                   too).
-            //
-            // We deliberately do NOT use `DISCARD ALL`. DISCARD includes
-            // `DEALLOCATE ALL`, which deallocates *all* prepared statements
-            // server-side — including the typeinfo statements that
-            // tokio_postgres caches per-Client to resolve custom enum/domain
-            // Oids. After DISCARD, tokio_postgres still holds Statement
-            // objects whose names the server has forgotten, so the next
-            // custom-type query fails with `prepared statement "sN" does not
-            // exist`. The trade-off: temp tables and user-PREPARE statements
-            // may persist across cached-connection reuse (rare in datatable /
-            // script workloads).
-            //
-            // Doubles as a liveness probe — if the connection is broken any
-            // statement in the chain fails and we replace it.
-            let probe_client = &guard.as_ref().unwrap().as_ref().unwrap().1;
-            if probe_client
-                .batch_execute(
-                    "RESET ALL; \
+    if lease.conn.is_some() {
+        // Probe the cached connection with a curated session reset before
+        // reusing it. Each statement targets a specific class of state:
+        //
+        //   RESET ALL                     — GUC parameters (search_path,
+        //                                   application_name, statement_
+        //                                   timeout, transaction_*…). Note
+        //                                   that this does NOT reset SET
+        //                                   ROLE or SET SESSION
+        //                                   AUTHORIZATION (security!).
+        //   RESET SESSION AUTHORIZATION   — undoes both `SET SESSION
+        //                                   AUTHORIZATION` and `SET ROLE`,
+        //                                   restoring the connecting user.
+        //                                   Without this a previous job
+        //                                   leaving an elevated role
+        //                                   active would silently leak
+        //                                   permissions into the next.
+        //   UNLISTEN *                    — drops LISTEN registrations.
+        //   CLOSE ALL                     — closes open cursors.
+        //   pg_advisory_unlock_all()      — releases any session-scoped
+        //                                   advisory locks. Without this
+        //                                   a job that called
+        //                                   pg_advisory_lock and exited
+        //                                   without unlocking would block
+        //                                   later jobs holding the same
+        //                                   key (DISCARD ALL covered this
+        //                                   too).
+        //
+        // We deliberately do NOT use `DISCARD ALL`. DISCARD includes
+        // `DEALLOCATE ALL`, which deallocates *all* prepared statements
+        // server-side — including the typeinfo statements that
+        // tokio_postgres caches per-Client to resolve custom enum/domain
+        // Oids. After DISCARD, tokio_postgres still holds Statement
+        // objects whose names the server has forgotten, so the next
+        // custom-type query fails with `prepared statement "sN" does not
+        // exist`. The trade-off: temp tables and user-PREPARE statements
+        // may persist across cached-connection reuse (rare in datatable /
+        // script workloads).
+        //
+        // Doubles as a liveness probe — if the connection is broken any
+        // statement in the chain fails and we replace it.
+        if lease
+            .client()
+            .batch_execute(
+                "RESET ALL; \
                      RESET SESSION AUTHORIZATION; \
                      UNLISTEN *; \
                      CLOSE ALL; \
                      SELECT pg_advisory_unlock_all();",
-                )
-                .await
-                .is_ok()
-            {
-                tracing::info!("Using cached connection");
-                CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                LAST_QUERY.store(
-                    chrono::Utc::now().timestamp().try_into().unwrap_or(0),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                cached_client = guard;
-                new_client = None;
-            } else {
-                tracing::info!("Cached connection is stale, creating new one");
-                if let Some(ref mut g) = guard {
-                    **g = None;
-                }
-                drop(guard);
-                cached_client = None;
-                new_client = Some(new_pg_connection(&database, auth_mode, conn.as_sql()).await?);
-            }
+            )
+            .await
+            .is_ok()
+        {
+            tracing::info!("Using cached connection");
+            CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
-            // Release the lock before connecting so the post-query caching
-            // code can re-acquire it.
-            drop(guard);
-            cached_client = None;
-            new_client = Some(new_pg_connection(&database, auth_mode, conn.as_sql()).await?);
+            tracing::info!("Cached connection is stale, creating new one");
+            cached_connection_failed_reset = true;
+            lease.discard();
         }
-    } else {
-        cached_client = None;
-        new_client = Some(new_pg_connection(&database, auth_mode, conn.as_sql()).await?);
+    }
+    if lease.conn.is_none() {
+        let (client, connection_task) =
+            new_pg_connection(&database, auth_mode, conn.as_sql()).await?;
+        lease.conn = Some(PgConnection {
+            key: database_string.clone(),
+            client,
+            connection_task,
+            last_used: std::time::Instant::now(),
+        });
+    }
+
+    let fresh_connection = lease.slot == PgLeaseSlot::Uncached;
+    let log_progress = !run_inline && !annotations.prepare;
+    let connect_time = connect_started.elapsed();
+    if log_progress && connect_time >= PG_SLOW_STEP {
+        windmill_queue::append_logs(
+            &job.id,
+            &job.workspace_id,
+            format!(
+                "Getting a database connection took {} ms ({})\n",
+                connect_time.as_millis(),
+                if cached_connection_failed_reset {
+                    "the cached connection failed its reset, then a new connection"
+                } else {
+                    connection_kind(fresh_connection)
+                }
+            ),
+            conn,
+        )
+        .await;
     }
 
     let (mut sig, _) = parse_pgsql_sig_with_typed_schema(&query)
@@ -903,12 +1248,7 @@ pub async fn do_postgresql(
 
     let queries = parse_sql_blocks(query, true);
 
-    let (client, handle) = if let Some((client, handle)) = new_client.as_ref() {
-        (client, Some(handle))
-    } else {
-        let (_, client) = cached_client.as_ref().unwrap().as_ref().unwrap();
-        (client, None)
-    };
+    let client = lease.client();
 
     let param_idx_to_arg_and_value = sig
         .args
@@ -918,6 +1258,9 @@ pub async fn do_postgresql(
 
     let size = AtomicUsize::new(0);
     let size_ref = &size;
+    let progress = PgProgress::new();
+    let progress_ref = &progress;
+    let statement_count = queries.len();
     let result_f = async move {
         let mut results = vec![];
         // Session reset (DISCARD ALL) is now handled eagerly when validating
@@ -955,6 +1298,9 @@ pub async fn do_postgresql(
             let skip_collect = collection_strategy.collect_last_statement_only(queries.len())
                 && i < queries.len() - 1;
             let is_last = i == queries.len() - 1;
+            progress_ref.start_statement(i);
+            let rows_before = progress_ref.rows();
+            let statement_started = std::time::Instant::now();
             let result = do_postgresql_inner(
                 query.to_string(),
                 &param_idx_to_arg_and_value,
@@ -976,8 +1322,24 @@ pub async fn do_postgresql(
                 &job.workspace_id,
                 conn,
                 annotations.raw_output && is_last && !skip_collect,
+                progress_ref,
             )?
             .await?;
+            let statement_time = statement_started.elapsed();
+            if log_progress && statement_time >= PG_SLOW_STEP {
+                windmill_queue::append_logs(
+                    &job.id,
+                    &job.workspace_id,
+                    format!(
+                        "Statement {}/{statement_count}: {} rows in {} ms\n",
+                        i + 1,
+                        progress_ref.rows() - rows_before,
+                        statement_time.as_millis()
+                    ),
+                    conn,
+                )
+                .await;
+            }
             results.push(result);
         }
 
@@ -988,6 +1350,16 @@ pub async fn do_postgresql(
             Ok(crate::pg_raw_output::extract_envelope_or_empty(results))
         } else {
             collection_strategy.collect(results)
+        }
+    };
+    let result_f = async {
+        if log_progress {
+            tokio::select! {
+                result = result_f => result,
+                never = warn_on_stalled_statement(progress_ref, statement_count, fresh_connection, job.id, &job.workspace_id, conn) => match never {},
+            }
+        } else {
+            result_f.await
         }
     };
 
@@ -1010,80 +1382,13 @@ pub async fn do_postgresql(
     }
     .map_err(|e| map_s3object_jsonb_overflow(e, had_s3object_input))?;
 
-    // Release the cache lock now that we have the result — allows the
-    // post-query caching code below to re-acquire it if needed.
-    drop(cached_client);
-
     *mem_peak = size.load(Ordering::Relaxed) as i32;
 
-    if let Some(handle) = handle {
-        if !*CLOUD_HOSTED {
-            if let Ok(mut mtex) = CONNECTION_CACHE.try_lock() {
-                if mtex.as_ref().is_none_or(|x| x.0 != database_string) {
-                    let abort_handler = handle.abort_handle();
-
-                    let mut cache_new_con = false;
-                    if let Some(new_client) = new_client {
-                        cache_new_con = is_most_used_conn(&database_string).await;
-                        if cache_new_con {
-                            *mtex = Some((database_string, new_client.0));
-                        } else {
-                            new_client.1.abort();
-                        }
-                    } else {
-                        handle.abort();
-                    }
-
-                    if cache_new_con {
-                        LAST_QUERY.store(
-                            chrono::Utc::now().timestamp().try_into().unwrap_or(0),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        tokio::spawn(async move {
-                            loop {
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                                let last_query =
-                                    LAST_QUERY.load(std::sync::atomic::Ordering::Relaxed);
-                                let now = chrono::Utc::now().timestamp().try_into().unwrap_or(0);
-
-                                //we cache connection for 5 minutes at most
-                                if last_query + 60 * 1 < now {
-                                    // tracing::error!("Closing cache connection due to inactivity");
-                                    tracing::info!(
-                                        "Closing cache pg executor connection due to inactivity"
-                                    );
-                                    break;
-                                }
-                                let mtex = CONNECTION_CACHE.lock().await;
-                                if mtex.is_none() {
-                                    // connection is not in the mutex anymore
-                                    break;
-                                } else if let Some(mtex) = mtex.as_ref() {
-                                    if mtex.0.as_str() != &database_string_clone {
-                                        // connection is not the latest one
-                                        break;
-                                    }
-                                }
-
-                                tracing::debug!(
-                                    "Keeping cached pg executor connection alive due to activity"
-                                )
-                            }
-                            let mut mtex = CONNECTION_CACHE.lock().await;
-                            *mtex = None;
-                            abort_handler.abort();
-                        });
-                    }
-                } else {
-                    handle.abort();
-                }
-            } else {
-                handle.abort();
-            }
-        } else {
-            handle.abort();
-        }
+    if !*CLOUD_HOSTED && lease.slot == PgLeaseSlot::Uncached {
+        lease.cache_on_release = is_most_used_conn(&database_string).await;
     }
+    drop(lease);
+
     *mem_peak = (result.get().len() / 1000) as i32;
     // And then check that we got back the same string we sent over.
     return Ok(result);
@@ -1889,8 +2194,8 @@ pub fn pg_cell_to_json_value_with_state(
         Type::UUID => get_basic(row, column, column_i, |a: uuid::Uuid| {
             Ok(JSONValue::String(a.to_string()))
         })?,
-        Type::INET => get_basic(row, column, column_i, |a: IpAddr| {
-            Ok(JSONValue::String(a.to_string()))
+        Type::INET | Type::CIDR => get_basic(row, column, column_i, |a: InetStr| {
+            Ok(JSONValue::String(a.0))
         })?,
         Type::INTERVAL => get_basic(row, column, column_i, |a: IntervalStr| {
             Ok(JSONValue::String(a.0))
@@ -1996,6 +2301,9 @@ pub fn pg_cell_to_json_value_with_state(
         })?,
         Type::BYTEA_ARRAY => get_array(row, column, column_i, |a: Vec<u8>| {
             Ok(JSONValue::String(format!("\\x{}", hex::encode(a))))
+        })?,
+        Type::INET_ARRAY | Type::CIDR_ARRAY => get_array(row, column, column_i, |a: InetStr| {
+            Ok(JSONValue::String(a.0))
         })?,
         Type::VOID => JSONValue::Null,
         // Default fallback for unhandled column types: read as text. We use
@@ -2156,6 +2464,29 @@ fn get_array<'a, T: FromSql<'a>>(
     })
 }
 
+/// `inet` / `cidr` in Postgres's own text form. `IpAddr`'s `FromSql` drops the
+/// prefix length, so a network such as `10.0.0.0/8` would read back as a host.
+struct InetStr(String);
+impl FromSql<'_> for InetStr {
+    fn from_sql(
+        ty: &Type,
+        raw: &[u8],
+    ) -> Result<InetStr, Box<dyn std::error::Error + Sync + Send>> {
+        let inet = postgres_protocol::types::inet_from_sql(raw)?;
+        let host_prefix = if inet.addr().is_ipv4() { 32 } else { 128 };
+        Ok(InetStr(
+            if *ty == Type::CIDR || inet.netmask() != host_prefix {
+                format!("{}/{}", inet.addr(), inet.netmask())
+            } else {
+                inet.addr().to_string()
+            },
+        ))
+    }
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::INET | Type::CIDR)
+    }
+}
+
 // you can remove this section if not using TS_VECTOR (or other types requiring an intermediary `FromSQL` struct)
 struct StringCollector(String);
 impl FromSql<'_> for StringCollector {
@@ -2269,6 +2600,19 @@ mod tests {
             map_s3object_jsonb_overflow(pg_err2, false).to_string(),
             "jsonb array elements exceeds the maximum",
         );
+    }
+
+    #[test]
+    fn inet_keeps_the_prefix_postgres_prints() {
+        let inet = |netmask: u8, addr: [u8; 4]| {
+            let mut raw = vec![2, netmask, 0, 4];
+            raw.extend(addr);
+            raw
+        };
+        let read = |ty: &Type, raw: &[u8]| InetStr::from_sql(ty, raw).unwrap().0;
+        assert_eq!(read(&Type::INET, &inet(32, [10, 1, 2, 3])), "10.1.2.3");
+        assert_eq!(read(&Type::INET, &inet(8, [10, 0, 0, 0])), "10.0.0.0/8");
+        assert_eq!(read(&Type::CIDR, &inet(32, [10, 1, 2, 3])), "10.1.2.3/32");
     }
 
     #[test]
@@ -2470,6 +2814,39 @@ mod tests {
 
     fn typ_for(arg_t: &str) -> Typ {
         windmill_parser_sql::parse_pg_typ(arg_t)
+    }
+
+    #[test]
+    fn only_rowless_statements_skip_the_describe() {
+        for q in [
+            "SELECT * FROM t",
+            "-- $1 n (int)\nselect $1",
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+            "INSERT INTO t VALUES (1) RETURNING id",
+            "/* c */ UPDATE t SET a = 1\nreturning *",
+            "UPDATE t SET note = $$a;b$$ RETURNING *",
+            "/* /* inner */ INSERT */ SELECT * FROM t",
+            "/* never closed INSERT",
+            "-- INSERT",
+            "-- header\rSELECT m, pad AS\nupdate FROM t",
+            "insert_rows()",
+            "TABLE t",
+            "VALUES (1)",
+            "EXPLAIN SELECT 1",
+        ] {
+            assert!(can_stream_rows(q), "{q}");
+        }
+        for q in [
+            "INSERT INTO t VALUES (1)",
+            "-- $1 n (int)\nUPDATE t SET a = $1",
+            "delete from t",
+            "CREATE TABLE t (a int)",
+            "SET search_path TO x",
+            "CALL p()",
+            "/* a /* b */ c */\n-- d\nINSERT INTO t VALUES (1)",
+        ] {
+            assert!(!can_stream_rows(q), "{q}");
+        }
     }
 
     #[test]

@@ -212,6 +212,7 @@ async fn test_deno_flow(db: Pool<Postgres>) -> anyhow::Result<()> {
                     apply_preprocessor: None,
                     pass_flow_input_directly: None,
                     debouncing: None,
+                    job_token_scopes: None,
                 },
                 FlowModule {
                     id: "b".to_string(),
@@ -260,6 +261,7 @@ async fn test_deno_flow(db: Pool<Postgres>) -> anyhow::Result<()> {
                             apply_preprocessor: None,
                             pass_flow_input_directly: None,
                             debouncing: None,
+                            job_token_scopes: None,
                         }],
                         modules_node: None,
                     }
@@ -282,6 +284,7 @@ async fn test_deno_flow(db: Pool<Postgres>) -> anyhow::Result<()> {
                     apply_preprocessor: None,
                     pass_flow_input_directly: None,
                     debouncing: None,
+                    job_token_scopes: None,
                 },
             ],
             same_worker: false,
@@ -398,6 +401,7 @@ async fn test_deno_flow_same_worker(db: Pool<Postgres>) -> anyhow::Result<()> {
                     apply_preprocessor: None,
                     pass_flow_input_directly: None,
                     debouncing: None,
+                    job_token_scopes: None,
                 },
                 FlowModule {
                     id: "b".to_string(),
@@ -455,6 +459,7 @@ async fn test_deno_flow_same_worker(db: Pool<Postgres>) -> anyhow::Result<()> {
                                 apply_preprocessor: None,
                                 pass_flow_input_directly: None,
                                 debouncing: None,
+                                job_token_scopes: None,
                             },
                             FlowModule {
                                 id: "e".to_string(),
@@ -498,6 +503,7 @@ async fn test_deno_flow_same_worker(db: Pool<Postgres>) -> anyhow::Result<()> {
                                 apply_preprocessor: None,
                                 pass_flow_input_directly: None,
                                 debouncing: None,
+                                job_token_scopes: None,
                             },
                         ],
                         modules_node: None,
@@ -520,6 +526,7 @@ async fn test_deno_flow_same_worker(db: Pool<Postgres>) -> anyhow::Result<()> {
                     apply_preprocessor: None,
                     pass_flow_input_directly: None,
                     debouncing: None,
+                    job_token_scopes: None,
                 },
                 FlowModule {
                     id: "c".to_string(),
@@ -569,6 +576,7 @@ async fn test_deno_flow_same_worker(db: Pool<Postgres>) -> anyhow::Result<()> {
                     apply_preprocessor: None,
                     pass_flow_input_directly: None,
                     debouncing: None,
+                    job_token_scopes: None,
                 },
             ],
             same_worker: true,
@@ -1750,8 +1758,9 @@ async fn test_postgresql_cached_connection_released_for_other_key(
     let server = ApiServer::start(db.clone()).await?;
     let port = server.addr.port();
 
-    // Two cache keys for the same role: only the sslmode differs.
-    let run = |sslmode: &str| {
+    // Keys for the same role: one pool scope when only the sslmode differs, two
+    // when the database does, which the role's limit still counts together.
+    let run = |dbname: &str, sslmode: &str| {
         RunJob::from(JobPayload::Code(RawCode {
             hash: None,
             content: "SELECT 1 as n;".into(),
@@ -1770,7 +1779,7 @@ async fn test_postgresql_cached_connection_released_for_other_key(
         }))
         .arg(
             "database",
-            json!({"host": "localhost", "port": 5432, "dbname": "windmill",
+            json!({"host": "localhost", "port": 5432, "dbname": dbname,
                    "user": "wm_pg_cache_one_conn", "password": "changeme", "sslmode": sslmode}),
         )
         .run_until_complete(&db, false, port)
@@ -1779,17 +1788,143 @@ async fn test_postgresql_cached_connection_released_for_other_key(
     // The evicted connection's backend exits asynchronously, so a fresh
     // connection can briefly still count it. Retrying absorbs that; without the
     // eviction the cached connection stays open for 60s and every retry fails.
-    for sslmode in ["disable", "prefer", "disable"] {
+    for (dbname, sslmode) in [
+        ("windmill", "disable"),
+        ("windmill", "prefer"),
+        ("postgres", "disable"),
+        ("windmill", "disable"),
+    ] {
         let mut result = json!(null);
         for _ in 0..5 {
-            result = run(sslmode).await.json_result().unwrap();
+            result = run(dbname, sslmode).await.json_result().unwrap();
             if result == json!([{"n": 1}]) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        assert_eq!(result, json!([{"n": 1}]), "sslmode={sslmode}");
+        assert_eq!(result, json!([{"n": 1}]), "{dbname} sslmode={sslmode}");
     }
+
+    clear_pg_cache().await;
+    Ok(())
+}
+
+/// A transaction a script leaves open must not carry over into the next job
+/// that would reuse the connection.
+#[sqlx::test(fixtures("base"))]
+#[serial(pg_cache)]
+async fn test_postgresql_open_transaction_not_reused(db: Pool<Postgres>) -> anyhow::Result<()> {
+    use windmill_worker::pg_executor::clear_pg_cache;
+
+    initialize_tracing().await;
+    clear_pg_cache().await;
+
+    let server = ApiServer::start(db.clone()).await?;
+    let port = server.addr.port();
+    let dbname: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&db)
+        .await?;
+
+    let run = |content: &str| {
+        RunJob::from(JobPayload::Code(RawCode {
+            hash: None,
+            content: content.to_string(),
+            path: None,
+            lock: None,
+            language: ScriptLang::Postgresql,
+            cache_ttl: None,
+            cache_ignore_s3_path: None,
+            dedicated_worker: None,
+            concurrency_settings: windmill_common::runnable_settings::ConcurrencySettings::default(
+            )
+            .into(),
+            debouncing_settings: windmill_common::runnable_settings::DebouncingSettings::default(),
+            modules: None,
+            tag: None,
+        }))
+        .arg(
+            "database",
+            json!({"host": "localhost", "port": 5432, "dbname": dbname, "user": "postgres", "password": "changeme"}),
+        )
+        .run_until_complete(&db, false, port)
+    };
+
+    run("SELECT 1 as n;").await.json_result().unwrap();
+    let opened = run("BEGIN; SELECT 1 as n;").await.json_result().unwrap();
+    assert_eq!(opened, json!([{"n": 1}]));
+    run("SELECT 2 as n;").await.json_result().unwrap();
+
+    // A connection kept in the cache with the transaction open would sit idle
+    // in it, holding its locks, and run the next job inside it.
+    let mut idle_in_transaction = -1;
+    for _ in 0..20 {
+        idle_in_transaction = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND state LIKE 'idle in transaction%'",
+        )
+        .fetch_one(&db)
+        .await?;
+        if idle_in_transaction == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(idle_in_transaction, 0);
+
+    clear_pg_cache().await;
+    Ok(())
+}
+
+/// A worker alternating between two databases keeps a connection for each.
+#[sqlx::test(fixtures("base"))]
+#[serial(pg_cache)]
+async fn test_postgresql_cache_keeps_a_connection_per_database(
+    db: Pool<Postgres>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    use windmill_worker::pg_executor::{clear_pg_cache, CACHE_HITS};
+
+    initialize_tracing().await;
+    clear_pg_cache().await;
+
+    let server = ApiServer::start(db.clone()).await?;
+    let port = server.addr.port();
+
+    let run = |dbname: &str| {
+        RunJob::from(JobPayload::Code(RawCode {
+            hash: None,
+            content: "SELECT current_database() as d;".into(),
+            path: None,
+            lock: None,
+            language: ScriptLang::Postgresql,
+            cache_ttl: None,
+            cache_ignore_s3_path: None,
+            dedicated_worker: None,
+            concurrency_settings: windmill_common::runnable_settings::ConcurrencySettings::default(
+            )
+            .into(),
+            debouncing_settings: windmill_common::runnable_settings::DebouncingSettings::default(),
+            modules: None,
+            tag: None,
+        }))
+        .arg(
+            "database",
+            json!({"host": "localhost", "port": 5432, "dbname": dbname,
+                   "user": "postgres", "password": "changeme"}),
+        )
+        .run_until_complete(&db, false, port)
+    };
+
+    let hits_before = CACHE_HITS.load(Ordering::Relaxed);
+    for dbname in ["windmill", "postgres", "windmill", "postgres"] {
+        let result = run(dbname).await.json_result().unwrap();
+        assert_eq!(result, json!([{"d": dbname}]));
+    }
+    let hits = CACHE_HITS.load(Ordering::Relaxed) - hits_before;
+    assert_eq!(
+        hits, 2,
+        "the last two jobs should reuse a cached connection"
+    );
 
     clear_pg_cache().await;
     Ok(())
@@ -5725,6 +5860,7 @@ async fn test_flow_tag_judged_as_written_before_preprocessor(
         apply_preprocessor: true,
         version: 1443253234253456,
         labels: None,
+        job_token_scopes: None,
     })
     .as_user("test-user-2", "test2@windmill.dev")
     .run_until_complete(&db, false, port)

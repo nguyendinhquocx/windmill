@@ -1,7 +1,7 @@
 openapi: "3.0.3"
 
 info:
-  version: 1.823.0
+  version: 1.824.1
   title: Windmill API
 
   contact:
@@ -4492,6 +4492,12 @@ paths:
                     description: >-
                       Omitted when the seats counted are another workspace's, as they are for a
                       fork resolving to its billing root.
+                  service_accounts:
+                    type: integer
+                    description: >-
+                      Enabled service accounts, half a seat each like operators. Omitted when the
+                      seats counted are another workspace's, as they are for a fork resolving to
+                      its billing root.
                   seats:
                     type: integer
                 required:
@@ -28478,6 +28484,8 @@ components:
       $ref: "../../openflow.openapi.yaml#/components/schemas/AiTransform"
     ProviderConfig:
       $ref: "../../openflow.openapi.yaml#/components/schemas/ProviderConfig"
+    ProviderTransform:
+      $ref: "../../openflow.openapi.yaml#/components/schemas/ProviderTransform"
     MemoryConfig:
       $ref: "../../openflow.openapi.yaml#/components/schemas/MemoryConfig"
     FlowModuleValue:
@@ -28498,6 +28506,8 @@ components:
       $ref: "../../openflow.openapi.yaml#/components/schemas/BranchAll"
     AiAgent:
       $ref: "../../openflow.openapi.yaml#/components/schemas/AiAgent"
+    AiDecision:
+      $ref: "../../openflow.openapi.yaml#/components/schemas/AiDecision"
     Identity:
       $ref: "../../openflow.openapi.yaml#/components/schemas/Identity"
     FlowStatus:
@@ -29462,6 +29472,8 @@ components:
           togetherai,
           aws_bedrock,
           customai,
+          typesafe,
+          cloudflare,
         ]
 
     GitSyncObjectType:

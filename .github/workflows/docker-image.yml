@@ -203,33 +203,16 @@ jobs:
 
       - name: Rename binary with corresponding architecture
         run: |
-          set -euo pipefail
-          mkdir -p release
-          # extract <image> (<path in image> <release file name>)...
-          extract() {
-            local image=$1 cid
-            shift
-            docker pull --platform "linux/$ARCH" "$image"
-            docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image"
-            cid=$(docker create --platform "linux/$ARCH" "$image")
-            while [ $# -gt 0 ]; do
-              docker cp "$cid:$1" "release/$2"
-              shift 2
-            done
-            docker rm "$cid"
-            docker rmi "$image"
-            df -h /
-          }
-          extract "$CE_IMAGE" \
-            /usr/src/app/windmill "windmill-$ARCH" \
-            /usr/src/app/windmill_duckdb_runner windmill_duckdb_runner
-          extract "$EE_IMAGE" /usr/src/app/windmill "windmill-ee-$ARCH"
-          ls -la release
+          mv "${{ steps.extract.outputs.destination }}/windmill" "${{ steps.extract.outputs.destination }}/windmill-${ARCH}"
+          mv "${{ steps.extract-ee.outputs.destination }}/windmill" "${{ steps.extract-ee.outputs.destination }}/windmill-ee-${ARCH}"
 
       - name: Attach binary to release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*
+          files: |
+            ${{ steps.extract.outputs.destination }}/*
+            ${{ steps.extract-ee.outputs.destination }}/*
+            ${{ steps.extract-duckdb-ffi-internal.outputs.destination }}/*
 
   attach_ee_debug_to_release:
     needs: [build_ee]

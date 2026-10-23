@@ -2549,6 +2549,26 @@ async fn test_rename_records_the_vacated_path(db: Pool<Postgres>) -> anyhow::Res
             "script deploy failed: {status} — {hash}"
         );
         parent_hash = Some(hash.trim().trim_matches('"').to_string());
+        // Each deploy tallies from its own spawned task: let the create's `write` land
+        // before the rename, or it can overwrite the `rename_from` asserted below.
+        if path == "u/admin/inline" {
+            let mut written = false;
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                written = sqlx::query_scalar!(
+                    "SELECT EXISTS (SELECT 1 FROM workspace_diff
+                     WHERE fork_workspace_id = 'wm-fork-renamed' AND kind = 'script'
+                       AND path = 'u/admin/inline' AND fork_last_event_kind = 'write')"
+                )
+                .fetch_one(&db)
+                .await?
+                .unwrap_or(false);
+                if written {
+                    break;
+                }
+            }
+            assert!(written, "the inline create should be tallied");
+        }
     }
     let mut vacated = None;
     for _ in 0..40 {
@@ -2556,7 +2576,7 @@ async fn test_rename_records_the_vacated_path(db: Pool<Postgres>) -> anyhow::Res
         vacated = sqlx::query!(
             "SELECT fork_last_event_kind, fork_last_event_origin FROM workspace_diff
              WHERE fork_workspace_id = 'wm-fork-renamed' AND kind = 'script'
-               AND path = 'u/admin/inline' AND fork_last_event_kind IS NOT NULL"
+               AND path = 'u/admin/inline' AND fork_last_event_kind <> 'write'"
         )
         .fetch_optional(&db)
         .await?;
@@ -2706,6 +2726,8 @@ async fn test_compare_secret_variables_by_value(db: Pool<Postgres>) -> anyhow::R
         "the same secret must be stored as two different ciphertexts"
     );
 
+    // The creates above tally these rows from a spawned task that can land after the
+    // DELETE, so the plant must upsert.
     sqlx::query!("DELETE FROM workspace_diff WHERE fork_workspace_id = 'wm-fork-secrets'")
         .execute(&db)
         .await?;
@@ -2714,7 +2736,9 @@ async fn test_compare_secret_variables_by_value(db: Pool<Postgres>) -> anyhow::R
          (source_workspace_id, fork_workspace_id, path, kind, ahead, behind, has_changes)
          VALUES
          ('test-workspace', 'wm-fork-secrets', 'u/test-user/same', 'variable', 1, 1, NULL),
-         ('test-workspace', 'wm-fork-secrets', 'u/test-user/different', 'variable', 1, 1, NULL)"
+         ('test-workspace', 'wm-fork-secrets', 'u/test-user/different', 'variable', 1, 1, NULL)
+         ON CONFLICT (source_workspace_id, fork_workspace_id, path, kind)
+         DO UPDATE SET ahead = 1, behind = 1, has_changes = NULL"
     )
     .execute(&db)
     .await?;
@@ -2742,6 +2766,86 @@ async fn test_compare_secret_variables_by_value(db: Pool<Postgres>) -> anyhow::R
     assert!(
         listed("u/test-user/different"),
         "different secrets must compare as changed: {comparison}"
+    );
+
+    Ok(())
+}
+
+/// `compare_two_variables` hand-lists its columns, so a forgotten one hides that difference
+/// from the fork diff, and it can never be promoted.
+#[sqlx::test(migrations = "../migrations", fixtures("base"))]
+async fn test_compare_variables_detects_value_valid_until(db: Pool<Postgres>) -> anyhow::Result<()> {
+    initialize_tracing().await;
+
+    let server = ApiServer::start(db.clone()).await?;
+    let port = server.addr.port();
+    let base_url = format!("http://localhost:{port}/api");
+    let admin = windmill_api_client::create_client(
+        &format!("http://localhost:{port}"),
+        "SECRET_TOKEN".to_string(),
+    );
+
+    sqlx::query!(
+        "INSERT INTO variable (workspace_id, path, value, is_secret, description, value_valid_until)
+         VALUES ('test-workspace', 'u/admin/expiring', 'v', false, 'same', '2027-01-01T00:00:00Z')"
+    )
+    .execute(&db)
+    .await?;
+
+    let resp = admin
+        .client()
+        .post(&format!(
+            "{base_url}/w/test-workspace/workspaces/create_fork"
+        ))
+        .json(&json!({ "id": "wm-fork-expiry", "name": "Expiry Fork" }))
+        .send()
+        .await?;
+    assert!(
+        resp.status().is_success(),
+        "fork creation failed: {}",
+        resp.status()
+    );
+
+    // Before the UPDATE below overwrites it: the fork must inherit the date from the source.
+    let inherited: Option<String> = sqlx::query_scalar(
+        "SELECT to_char(value_valid_until, 'YYYY-MM-DD') FROM variable
+         WHERE workspace_id = 'wm-fork-expiry' AND path = 'u/admin/expiring'",
+    )
+    .fetch_one(&db)
+    .await?;
+    assert_eq!(inherited.as_deref(), Some("2027-01-01"));
+
+    // Only the expiry differs.
+    sqlx::query!(
+        "UPDATE variable SET value_valid_until = '2029-12-31T00:00:00Z'
+         WHERE workspace_id = 'wm-fork-expiry' AND path = 'u/admin/expiring'"
+    )
+    .execute(&db)
+    .await?;
+
+    // Forces the endpoint to re-evaluate the pair rather than trust a cached verdict.
+    sqlx::query!(
+        "INSERT INTO workspace_diff
+         (source_workspace_id, fork_workspace_id, path, kind, ahead, behind, has_changes)
+         VALUES ('test-workspace', 'wm-fork-expiry', 'u/admin/expiring', 'variable', 0, 1, NULL)"
+    )
+    .execute(&db)
+    .await?;
+
+    let comparison = admin
+        .client()
+        .get(&format!(
+            "{base_url}/w/test-workspace/workspaces/compare/wm-fork-expiry"
+        ))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    assert_eq!(
+        comparison["summary"]["variables_changed"].as_u64(),
+        Some(1),
+        "an expiry-only change must show as deployable: {comparison}"
     );
 
     Ok(())

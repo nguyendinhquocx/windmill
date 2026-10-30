@@ -79,6 +79,8 @@
 	import { updatePolicy } from './appPolicy'
 	import { appDraftSettings, withoutSharedPolicySettings } from './appDraftSettings'
 	import ShareDialog from '$lib/components/itemSettings/ShareDialog.svelte'
+	import { showAppLinks } from '$lib/components/itemSettings/AppLinksModal.svelte'
+	import { isSessionPreviewFrame } from '$lib/components/sessions/sessionMode.svelte'
 	import FirstDeployDialog, {
 		applyFirstDeployMembers
 	} from '$lib/components/itemSettings/FirstDeployDialog.svelte'
@@ -254,6 +256,9 @@
 	// `runtime.itemDeployed`, which discards the fork draft + reloads
 	// the preview to the deployed version.
 	const inSessionPane = !!getContext('aiChatManager')
+	// Share and the first-deploy dialog belong to Windmill's own editors: an embedding host can
+	// lock the path, which the dialog would let the user change.
+	const offersSharing = $derived(ownsPageHeader || inSessionPane)
 
 	// The header's buttons render under the page header, not under this component, so the contexts
 	// they look up have to travel with them. The app's own two carry everything the canvas toggles,
@@ -536,13 +541,14 @@
 		}
 		deploymentMsg = message ?? ''
 		firstDeployMembers = {}
-		if (newApp && ownsPageHeader) {
+		if (newApp && firstDeployDialog) {
 			// The dialog also asks who the app runs on behalf of, for the path it chose.
-			const choice = await firstDeployDialog?.ask({
+			const choice = await firstDeployDialog.ask({
 				kind: 'app',
 				summary: $summary,
 				path: newEditedPath,
 				appMode: accessModeOf(policy),
+				customPath,
 				runAs: {
 					email: policy.on_behalf_of_email,
 					permissionedAs: policy.on_behalf_of,
@@ -553,6 +559,7 @@
 			$summary = choice.summary
 			newEditedPath = choice.path
 			policy.execution_mode = choice.appMode
+			customPath = choice.customPath
 			if (choice.runAs) {
 				policy.on_behalf_of_email = choice.runAs.email
 				policy.on_behalf_of = choice.runAs.permissionedAs
@@ -602,8 +609,12 @@
 		// `$appPath` — its `draft_{uuid}` is a poor create signal.
 		if (newApp) {
 			const members = firstDeployMembers
-			if (await createApp(newEditedPath)) {
-				await applyFirstDeployMembers($workspaceStore!, 'app', newEditedPath, members)
+			const workspace = $workspaceStore!
+			const path = newEditedPath
+			const links = { workspace, path, mode: accessModeOf(policy), customPath }
+			if (await createApp(path)) {
+				await applyFirstDeployMembers(workspace, 'app', path, members)
+				if (offersSharing) showAppLinks(links)
 			}
 		} else {
 			await handleUpdateApp(newEditedPath)
@@ -961,6 +972,16 @@
 	})
 
 	let customPath = $state(savedApp?.custom_path)
+	/** Share and the settings drawer write who can open the deployed app and its custom URL at
+	 *  once: the editor follows, so its next deploy and diff see them. */
+	function applyAppAccess(row: { policy: Policy; custom_path?: string | null }) {
+		policy.execution_mode = row.policy.execution_mode
+		customPath = row.custom_path ?? undefined
+		if (savedApp) {
+			savedApp.policy = { ...savedApp.policy, execution_mode: row.policy.execution_mode }
+			savedApp.custom_path = row.custom_path ?? undefined
+		}
+	}
 	let labels = $state(untrack(() => initialLabels))
 
 	$effect(() => {
@@ -1040,20 +1061,12 @@
 	bind:pathError
 	bind:newEditedPath
 	bind:labels
+	bind:customPath
+	onAppChanged={applyAppAccess}
 />
 
-{#if ownsPageHeader}
-	<ShareDialog
-		bind:this={shareDialog}
-		onAppChanged={(row) => {
-			policy.execution_mode = row.policy.execution_mode
-			customPath = row.custom_path ?? undefined
-			if (savedApp) {
-				savedApp.policy = { ...savedApp.policy, execution_mode: row.policy.execution_mode }
-				savedApp.custom_path = row.custom_path ?? undefined
-			}
-		}}
-	/>
+{#if offersSharing}
+	<ShareDialog bind:this={shareDialog} onAppChanged={applyAppAccess} />
 	<FirstDeployDialog bind:this={firstDeployDialog} />
 {/if}
 
@@ -1423,7 +1436,7 @@
 					Settings
 				</Button>
 			</div>
-			{#if ownsPageHeader}
+			{#if offersSharing}
 				<ShareButton deployed={!newApp} iconOnly={compactTopbar} onclick={openShare} />
 			{/if}
 		{/if}
@@ -1433,7 +1446,7 @@
 			iconOnly={phoneTopbar}
 			unifiedSize={phoneTopbar ? 'sm' : 'md'}
 			on:save={({ detail }) => deploy(detail)}
-			dropdownItems={$appPath != ''
+			dropdownItems={$appPath != '' && !isSessionPreviewFrame()
 				? () => [
 						{
 							label: 'Fork',

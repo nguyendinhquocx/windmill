@@ -1,9 +1,11 @@
 import { JobService, type ListRecentRunsResponse } from '$lib/gen'
-import { getLocalSetting, storeLocalSetting } from '$lib/utils'
+import { getLocalSetting, MAX_RESOLUTION_BATCH, storeLocalSetting } from '$lib/utils'
+import { sendUserToast } from '$lib/toast'
 import { IsDocumentVisible, useInterval } from 'runed'
 import { persistedResource } from '$lib/persistedResource.svelte'
 import { homeComposerContext } from '$lib/components/sessions/homeComposerContext.svelte'
 import { runContextElement } from '$lib/components/copilot/chat/context'
+import { runsTimeframes } from '$lib/components/runs/timeframes'
 
 export type RecentRuns = ListRecentRunsResponse
 export type RecentRunItem = RecentRuns['items'][number]
@@ -30,7 +32,7 @@ export function useRecentRuns(
 			workspace && enabled ? await JobService.listRecentRuns({ workspace, folder }) : undefined,
 		{
 			name: 'recent_runs',
-			version: 1,
+			version: 2,
 			scope: ({ workspace, folder, enabled }) =>
 				workspace && enabled ? { workspace, args: { folder } } : undefined
 		}
@@ -49,8 +51,49 @@ export function useRecentRuns(
 		get current() {
 			return runs.current
 		},
+		/** A read is in flight; with no `current` yet, nothing is known about the window. */
+		get loading() {
+			return runs.loading
+		},
+		/** The latest read failed: with no `current`, the panel would otherwise read as empty. */
+		get failed() {
+			return runs.error !== undefined
+		},
+		retry() {
+			if (!runs.loading) runs.refetch()
+		},
 		get now() {
 			return now
+		},
+		/** Marks every unresolved failure of `item` in the window as resolved. */
+		async resolveFailures(item: RecentRunItem) {
+			const { workspace, folder } = args()
+			if (!workspace) return
+			let resolved = 0
+			try {
+				// Read on click, for this item only: the endpoint files each run under its item the
+				// way the row counts it, which a job listing cannot (a `singlestepflow` wraps a script
+				// or a flow).
+				const read = await JobService.listRecentRuns({
+					workspace,
+					folder,
+					failedIdsKind: item.kind,
+					failedIdsPath: item.path
+				})
+				const ids =
+					read.items.find((i) => i.kind === item.kind && i.path === item.path)?.failed_run_ids ?? []
+				for (let i = 0; i < ids.length; i += MAX_RESOLUTION_BATCH) {
+					const affected = await JobService.resolveCompletedJobs({
+						workspace,
+						requestBody: { job_ids: ids.slice(i, i + MAX_RESOLUTION_BATCH) }
+					})
+					resolved += affected.length
+				}
+				sendUserToast(`Resolved ${resolved} failed run${resolved === 1 ? '' : 's'}`)
+			} catch (e) {
+				sendUserToast(`Could not resolve the failed runs: ${e}`, true)
+			}
+			runs.refetch()
 		}
 	}
 }
@@ -85,6 +128,20 @@ export function runHref(id: string, workspace: string | undefined) {
 
 export function allRunsHref(folder: string | undefined) {
 	return folder ? `/runs?folder=${encodeURIComponent(folder)}` : '/runs'
+}
+
+/** The runs page over the runs the failed count is made of: unresolved failures of the window. */
+export function failedRunsHref(folder: string | undefined, windowHours: number) {
+	const params = new URLSearchParams({ status: 'failure', resolved: 'unresolved' })
+	if (folder) params.set('folder', folder)
+	// A preset timeframe stays relative to now, where a `min_ts` would freeze at render.
+	const timeframe = runsTimeframes.find((t) => {
+		const { minTs, maxTs } = t.computeMinMax()
+		const span = minTs && maxTs ? Date.parse(maxTs) - Date.parse(minTs) : NaN
+		return Math.abs(span - windowHours * 3600_000) < 1000
+	})
+	if (timeframe) params.set('timeframe', timeframe.label)
+	return `/runs?${params}`
 }
 
 export function windowLabel(hours: number) {

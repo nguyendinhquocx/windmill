@@ -47,8 +47,8 @@
 	import { useSearchParams } from '$lib/svelte5UtilsKit.svelte'
 	import { z } from 'zod'
 	import HomeAIChat from '$lib/components/home/HomeAIChat.svelte'
-	import { isGlobalAiEnabled } from '$lib/components/copilot/chat/global/gate'
 	import { onDestroy, onMount, untrack } from 'svelte'
+	import { homeSnapshotShown, releaseHomeSnapshot, watchHomeForSnapshot } from '$lib/homeSnapshot'
 	import OperatorTour from '$lib/components/tutorials/OperatorTour.svelte'
 	import {
 		hasSeenOperatorTour,
@@ -161,6 +161,16 @@
 			if (!pageEl || reducedMotion.val) return
 			pageEl.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 500, easing: 'ease-out' })
 		})
+	})
+
+	// Replacing the snapshot `app.html` painted, the page is already on screen: no arrival to play.
+	const fromSnapshot = homeSnapshotShown()
+	onMount(() => {
+		releaseHomeSnapshot()
+		return watchHomeForSnapshot(() => ({
+			workspace: $workspaceStore,
+			userWorkspace: $userStore?.workspace_id
+		}))
 	})
 
 	let operatorTour: OperatorTour | undefined = $state(undefined)
@@ -349,9 +359,14 @@
 	{/if}
 {/snippet}
 
+<!-- The layout has already painted the sidebar and the surface behind it, so only what is new to
+     this route fades in. It plays on every arrival at Home, not just the one off a workspace
+     hand-over: that is the arrival it is for, and a soft one costs nothing on the others. -->
 <div
 	bind:this={pageEl}
-	class="wm-page-in group/home flex flex-col w-full h-full overflow-y-auto items-center"
+	class="{fromSnapshot
+		? ''
+		: 'wm-page-in'} group/home flex flex-col w-full h-full overflow-y-auto items-center"
 	style="scrollbar-gutter: stable both-edges;"
 	style:--home-pinned="{pinnedHeight}px"
 >
@@ -378,13 +393,10 @@
 				bind:clientHeight={pinnedHeight}
 				class="{HOME_COLUMN_WIDTH} px-4 sm:px-8 md:px-8 h-fit w-full pb-6 shrink-0 bg-surface group-has-[[data-composer-open]]/home:sticky group-has-[[data-composer-open]]/home:top-0 group-has-[[data-composer-open]]/home:z-20"
 			>
-				<!-- HomeAIChat carries both the AI composer and the AI-independent CLI/MCP connect row,
-		     so it shows whenever the sessions beta is on; the composer itself is gated on the
-		     workspace inside the component, which owns its own vertical spacing
-		     because the hero and the bare connect row want different amounts of it. -->
-				{#if isGlobalAiEnabled()}
-					<HomeAIChat />
-				{/if}
+				<!-- HomeAIChat carries both the AI composer and the AI-independent CLI/MCP connect row;
+		     the composer itself is gated on the workspace inside the component, which owns its own
+		     vertical spacing because the hero and the bare connect row want different amounts of it. -->
+				<HomeAIChat />
 
 				{#if $workspaceStore == 'admins'}
 					<Alert title="Admins workspace">
@@ -497,28 +509,3 @@
 {#if !$roleCapabilities.code}
 	<OperatorTour bind:this={operatorTour} />
 {/if}
-
-<style>
-	/* The page's content arriving, rather than being there. The layout has already painted the
-	   sidebar and the surface behind it, so only what is new to this route fades. It plays on
-	   every arrival at Home, not just the one off a workspace hand-over — that is the arrival it
-	   is for, and a soft one costs nothing on the others. */
-	@keyframes wm-page-in {
-		from {
-			opacity: 0;
-		}
-		to {
-			opacity: 1;
-		}
-	}
-
-	.wm-page-in {
-		animation: wm-page-in 500ms ease-out both;
-	}
-
-	@media (prefers-reduced-motion: reduce) {
-		.wm-page-in {
-			animation: none;
-		}
-	}
-</style>

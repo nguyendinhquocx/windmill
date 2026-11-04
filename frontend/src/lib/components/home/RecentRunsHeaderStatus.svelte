@@ -1,11 +1,12 @@
 <script lang="ts">
 	import Popover from '$lib/components/meltComponents/Popover.svelte'
-	import { Button } from '$lib/components/common'
-	import { ChevronDown, ExternalLink, PanelRightOpen, Play } from 'lucide-svelte'
+	import { Button, Skeleton } from '$lib/components/common'
+	import { ChevronDown, ExternalLink, Loader2, PanelRightOpen, Play } from 'lucide-svelte'
 	import RecentRunRow from './RecentRunRow.svelte'
 	import {
 		allRunsHref,
 		askAI,
+		failedRunsHref,
 		canAskAI,
 		collisionPrefixes,
 		itemKey,
@@ -66,6 +67,9 @@
 					</span>
 				{:else}
 					<span>{data ? totalLabel(data) : 'Recent runs'}</span>
+					{#if !data && runs.loading}
+						<Loader2 size={12} class="animate-spin text-hint" />
+					{/if}
 					{#if data && data.failed_runs > 0}
 						<span class="flex items-center gap-1.5 text-red-600 dark:text-red-400">
 							<span class="w-[7px] h-[7px] rounded-full bg-red-500"></span>
@@ -120,6 +124,7 @@
 								{item}
 								now={runs.now}
 								prefix={prefixes.get(itemKey(item))}
+								onResolve={runs.resolveFailures}
 								strip={false}
 								onSelect={onFocusItem &&
 									((item) => {
@@ -140,10 +145,17 @@
 								{data.items.length - MAX_ITEMS} more
 							</a>
 						{/if}
+					{:else if runs.loading}
+						<Skeleton class="px-2.5 pt-2" layout={[[2.5], 0.25, [2.5], 0.25, [2.5]]} />
+					{:else if runs.failed}
+						<p class="flex items-center gap-1 px-2.5 pt-2 text-secondary text-[12.5px]">
+							Could not load recent runs.
+							<Button variant="subtle" unifiedSize="xs" onClick={() => runs.retry()}>Retry</Button>
+						</p>
 					{/if}
 
 					<div
-						class="flex items-center gap-2 px-1.5 pb-1 {data
+						class="flex items-center gap-1 px-1.5 pb-1 whitespace-nowrap {data
 							? 'mt-1.5 pt-2 border-t border-border-light'
 							: 'pt-1'}"
 					>
@@ -154,6 +166,16 @@
 							All runs
 							<ExternalLink size={12} />
 						</a>
+						{#if data && data.failed_runs > 0}
+							<Button
+								variant="subtle"
+								unifiedSize="sm"
+								endIcon={{ icon: ExternalLink }}
+								href={failedRunsHref(folder, data.window_hours)}
+							>
+								Failed runs
+							</Button>
+						{/if}
 						{#if onShowPanel}
 							<div class="ml-auto">
 								<Button

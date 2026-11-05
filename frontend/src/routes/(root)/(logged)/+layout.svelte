@@ -70,7 +70,7 @@
 	} from '$lib/stores'
 	import CenteredModal from '$lib/components/CenteredModal.svelte'
 	import { afterNavigate, beforeNavigate } from '$app/navigation'
-	import { goto } from '$lib/navigation'
+	import { goto, isNewTabClick } from '$lib/navigation'
 	import { registerToolDisplayActionHandler } from '$lib/components/copilot/chat/createdResourceActions.svelte'
 	import type UserSettings from '$lib/components/UserSettings.svelte'
 	import type SuperadminSettings from '$lib/components/SuperadminSettings.svelte'
@@ -145,6 +145,7 @@
 	import { useDbManagerUriState } from '$lib/components/dbManagerDrawerModel.svelte'
 	import Modal2 from '$lib/components/common/modal/Modal2.svelte'
 	import { recordForkParent, rememberForkParent } from '$lib/forkParentMemory'
+	import { recordWorkspaceVisit } from '$lib/utils/recentWorkspaces'
 	import { homeSnapshotShown } from '$lib/homeSnapshot'
 	import { persistedValue } from '$lib/persistedResource.svelte'
 	interface Props {
@@ -413,6 +414,7 @@
 				} catch (e) {
 					console.error('Could not persist workspace to local storage', e)
 				}
+				recordWorkspaceVisit(String(workspace))
 			}
 			// Rendering as the user whoami last confirmed for this session saves its round trip on
 			// a reload; whoami below confirms or replaces them. See lastSession.ts for the binding.
@@ -1321,7 +1323,8 @@ outside this layout, and their shortcut must reopen the URL that is their creden
 		isCollapsed={collapsed}
 		aiId="sidebar-menu-link-runs"
 		aiDescription="Button to navigate to runs"
-		onclick={() => {
+		onclick={(e) => {
+			if (isNewTabClick(e)) return
 			setTimeout(() => {
 				window.dispatchEvent(new Event('popstate'))
 			}, 100)

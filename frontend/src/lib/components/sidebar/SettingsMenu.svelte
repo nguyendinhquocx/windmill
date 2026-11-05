@@ -25,7 +25,6 @@
 		ShieldCheck
 	} from 'lucide-svelte'
 	import AccessDrawer from '../AccessDrawer.svelte'
-	import { goto } from '$lib/navigation'
 	import { type Item } from '$lib/utils'
 	import { logout } from '$lib/logoutKit'
 	import { isCloudHosted } from '$lib/cloud'
@@ -150,9 +149,9 @@
 
 	// Account / instance actions gathered under one "Settings" dropdown, shared by
 	// the session rail and the global sidebar so both expose the same entry point.
-	// Workspace- and instance-scoped entries sit between the account entries and Logout.
+	// Workspace- and instance-scoped entries sit between the account entries and Log out.
 	// Leaving a workspace lives on the workspace settings page, which every member reaches,
-	// not in this menu next to Logout: only a workspace admin can undo a leave.
+	// not in this menu next to Log out: only a workspace admin can undo a leave.
 	const workspaceInstanceItems = $derived<Item[]>([
 		...($roleCapabilities.visibility.folders
 			? [{ displayName: 'Folders', icon: FolderOpen, href: '/folders' }]
@@ -190,7 +189,7 @@
 					{
 						displayName: 'Instance settings',
 						icon: Settings,
-						action: () => goto(SUPERADMIN_SETTINGS_HASH)
+						href: SUPERADMIN_SETTINGS_HASH
 					}
 				]
 			: [])
@@ -233,7 +232,7 @@
 				{
 					displayName: 'Account settings',
 					icon: Settings,
-					action: () => goto(USER_SETTINGS_HASH)
+					href: USER_SETTINGS_HASH
 				},
 				// A superadmin who is not a member has no `usr` row, so there is no access to list.
 				...($userStore && !$userStore.non_member
@@ -251,7 +250,7 @@
 							{
 								displayName: 'Take the tour',
 								icon: GraduationCap,
-								action: () => goto(`/?${TOUR_PARAM}=${TOUR_PARAM_VALUE}`)
+								href: `/?${TOUR_PARAM}=${TOUR_PARAM_VALUE}`
 							}
 						]
 					: []),
@@ -268,7 +267,7 @@
 			]
 		},
 		...workspaceInstanceItems.map((item, i) => (i === 0 ? { ...item, separatorTop: true } : item)),
-		{ displayName: 'Logout', icon: LogOut, action: () => logout(), separatorTop: true }
+		{ displayName: 'Log out', icon: LogOut, action: () => logout(), separatorTop: true }
 	])
 
 	const logsItems = $derived<Item[]>([

@@ -13,7 +13,6 @@ use std::{collections::HashMap, sync::Arc, vec};
 use anyhow::Context;
 use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
-use futures::future::TryFutureExt;
 use itertools::Itertools;
 #[cfg(feature = "prometheus")]
 use prometheus::IntCounter;
@@ -76,7 +75,7 @@ use windmill_common::{
         add_virtual_items_if_necessary, FlowModule, FlowModuleValue, FlowValue, InputTransform,
         Retry, StopAfterIf,
     },
-    jobs::{get_payload_tag_from_prefixed_path, JobKind, JobPayload, RawCode},
+    jobs::{runnable_ref_to_payload, JobKind, JobPayload, RawCode},
     min_version::{MIN_VERSION_IS_AT_LEAST_1_432, MIN_VERSION_IS_AT_LEAST_1_440},
     runnable_ref::RunnableRef,
     schedule::Schedule,
@@ -797,8 +796,9 @@ async fn restart_perpetual_runs_at_path(
     // Built the way a run of this path is built anywhere else, so the next run takes the deployed
     // version's tag, timeout, language and identity. Whether its preprocessor runs is decided per
     // run, below.
+    let script = RunnableRef::from_path(script_path, false)?;
     let (mut payload, tag, _, _, timeout, on_behalf_of) =
-        script_path_to_payload(script_path, None, db.clone(), w_id, None).await?;
+        script_path_to_payload(&script, None, db.clone(), w_id, None).await?;
     // A replacement continues a loop rather than answering a trigger, and every perpetual restart
     // is pushed without debouncing for that reason. Deployed settings here would debounce the
     // loops at this path against each other and collapse those that share arguments into one.
@@ -3572,7 +3572,7 @@ pub async fn push_error_handler<'a, 'c, T: Serialize + Send + Sync>(
         w_id
     };
     let (payload, tag, on_behalf_of) =
-        get_payload_tag_from_prefixed_path(&on_failure.prefixed(), db, handler_w_id).await?;
+        runnable_ref_to_payload(on_failure, db, handler_w_id).await?;
 
     let mut extra = HashMap::new();
     if let Some(schedule_path) = schedule_path {
@@ -3766,8 +3766,7 @@ pub async fn push_success_handler<'a, 'c, T: Serialize + Send + Sync>(
     email: &str,
     priority: Option<i16>,
 ) -> windmill_common::error::Result<Uuid> {
-    let (payload, tag, on_behalf_of) =
-        get_payload_tag_from_prefixed_path(&on_success.prefixed(), db, w_id).await?;
+    let (payload, tag, on_behalf_of) = runnable_ref_to_payload(on_success, db, w_id).await?;
 
     let mut extra = HashMap::new();
     if let Some(schedule_path) = schedule_path {
@@ -9026,11 +9025,14 @@ async fn restarted_flows_resolution(
         })?;
         fetch_restart_flow_version(db, workspace_id, flow_path, flow_version.unwrap()).await?
     } else {
-        cache::job::fetch_flow(db, &row.job_kind, row.script_hash)
-            .or_else(|_| {
-                cache::job::fetch_preview_flow(db.into(), &completed_flow_id, row.raw_flow)
-            })
-            .await?
+        cache::job::fetch_flow_or_preview(
+            db,
+            &row.job_kind,
+            row.script_hash,
+            &completed_flow_id,
+            row.raw_flow,
+        )
+        .await?
     };
 
     let flow_value = flow_data.value();

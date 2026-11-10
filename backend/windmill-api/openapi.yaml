@@ -1,7 +1,7 @@
 openapi: "3.0.3"
 
 info:
-  version: 1.864.1
+  version: 1.865.0
   title: Windmill API
 
   contact:
@@ -21548,21 +21548,17 @@ paths:
             $ref: "#/components/schemas/NativeServiceName"
       requestBody:
         description: >-
-          redirect_uri, and where to save the connection (defaults to
-          u/{caller}/native_{resource_type}). Uses the workspace OAuth client, or the instance
-          one when the instance shares it.
+          Where to save the connection (defaults to u/{caller}/native_{resource_type}). Uses
+          the workspace OAuth client, or the instance one when the instance shares it, and the
+          redirect URI registered on that client.
         required: true
         content:
           application/json:
             schema:
               type: object
               properties:
-                redirect_uri:
-                  type: string
                 resource_path:
                   type: string
-              required:
-                - redirect_uri
       responses:
         "200":
           description: native trigger service connect url
@@ -21719,12 +21715,9 @@ paths:
                   type: string
                 state:
                   type: string
-                redirect_uri:
-                  type: string
               required:
                 - code
                 - state
-                - redirect_uri
       responses:
         "200":
           description: path of the saved connection
@@ -30387,7 +30380,10 @@ components:
           description: Mount path for the JWT auth method in Vault (optional, defaults to "jwt"). Set this when the JWT auth method is mounted at a non-default path, e.g. via `vault auth enable -path=<mount> jwt`.
         approle_role_id:
           type: string
-          description: AppRole role_id (optional). When set and no static token is given, Windmill logs in with AppRole; the secret_id is read from the `VAULT_APPROLE_SECRET_ID` environment variable of servers and workers.
+          description: AppRole role_id (optional). When set and no static token is given, Windmill logs in with AppRole.
+        approle_secret_id:
+          type: string
+          description: AppRole secret_id (optional). When empty, the `VAULT_APPROLE_SECRET_ID` environment variable of servers and workers is used; when that is unset too, no secret_id is sent (a role with `bind_secret_id=false`).
         approle_mount_path:
           type: string
           description: Mount path of the AppRole auth method (optional, defaults to "approle").
@@ -32233,6 +32229,9 @@ components:
           type: boolean
         trigger_kind:
           $ref: "#/components/schemas/JobTriggerKind"
+        trigger_path:
+          type: string
+          description: Path of the trigger, schedule or app that started the job, if any
         worker:
           type: string
       required:
@@ -32379,6 +32378,9 @@ components:
             resolution outside enterprise
         trigger_kind:
           $ref: "#/components/schemas/JobTriggerKind"
+        trigger_path:
+          type: string
+          description: Path of the trigger, schedule or app that started the job, if any
         worker:
           type: string
       required:
@@ -33967,6 +33969,11 @@ components:
           type: boolean
         account:
           type: number
+        scopes:
+          type: array
+          items:
+            type: string
+          description: OAuth scopes the linked account was connected with
         created_by:
           type: string
         edited_at:
@@ -40855,12 +40862,13 @@ components:
         redirect_uri:
           type: string
           format: uri
-          description: The OAuth redirect URI
+          description: >-
+            The redirect URI registered on the OAuth app. Absent for an app saved before it was
+            stored, which uses the workspace settings page.
       required:
         - client_id
         - client_secret
         - base_url
-        - redirect_uri
 
     WebhookEvent:
       type: object
@@ -40931,9 +40939,28 @@ components:
         workspace:
           type: boolean
           description: Whether this is the workspace connection, which every member may use
+        managed:
+          type: boolean
+          description: >-
+            Whether the integration trigger connect flow made it. Any other connection is a
+            resource connected from Resources, which triggers can use but only Resources can
+            replace or delete.
+        scopes:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: Scopes the account was connected with; absent when unknown
+        missing_scopes:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: Scopes the service's triggers need that the account lacks; absent when unknown
       required:
         - path
         - workspace
+        - managed
 
     CreateTriggerResponse:
       type: object

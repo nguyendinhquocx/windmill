@@ -23,7 +23,6 @@ use windmill_common::variables::{build_crypt_with_key_suffix, encrypt, Workspace
 use anyhow::Context;
 use async_once_cell::Lazy;
 use backon::{BackoffBuilder, ConstantBuilder, Retryable};
-use futures::TryFutureExt;
 use mappable_rc::Marc;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -515,9 +514,8 @@ pub async fn update_flow_status_after_job_completion_internal(
              ))
          })?;
 
-        let flow_data = cache::job::fetch_flow(db, &job_kind, script_hash)
-            .or_else(|_| cache::job::fetch_preview_flow(db, &flow, raw_flow))
-            .await?;
+        let flow_data =
+            cache::job::fetch_flow_or_preview(db, &job_kind, script_hash, &flow, raw_flow).await?;
         let flow_value = flow_data.value();
 
         let module_step = Step::from_i32_and_len(old_status.step, old_status.modules.len());
@@ -7004,7 +7002,7 @@ pub async fn script_to_payload(
             let script = RunnableRef::from_path(&script_path, false)?;
             let (jp, tag, delete_after_use, delete_after_secs, script_timeout, on_behalf_of) =
                 script_path_to_payload(
-                    script.path(),
+                    &script,
                     None,
                     db.clone(),
                     &flow_job.workspace_id,

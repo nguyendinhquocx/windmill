@@ -1,5 +1,60 @@
 # Changelog
 
+## [1.867.0](https://github.com/windmill-labs/windmill/compare/v1.866.0...v1.867.0) (2026-11-10)
+
+
+### Features
+
+* fold sidebar AI chats and sessions inactive for over a week ([#12314](https://github.com/windmill-labs/windmill/issues/12314)) ([466885f](https://github.com/windmill-labs/windmill/commit/466885fd26b74bd20de67ee0ef0e55a47826cd47))
+* gate public apps on cloud plans and unpublish them on archive ([#12321](https://github.com/windmill-labs/windmill/issues/12321)) ([a9f5a9c](https://github.com/windmill-labs/windmill/commit/a9f5a9caa0bce2162a34bca1cfd0438893945d6e))
+* reveal the failed call from a tool group's failed badge ([#12320](https://github.com/windmill-labs/windmill/issues/12320)) ([0e1464e](https://github.com/windmill-labs/windmill/commit/0e1464e877dcfabdffc8901d2a0735e04b73772e))
+
+
+### Bug Fixes
+
+* build Azure block upload URLs from the account endpoint ([#12333](https://github.com/windmill-labs/windmill/issues/12333)) ([38e7463](https://github.com/windmill-labs/windmill/commit/38e7463dd4e93c36f28fefb102bc5d0d3060cdf3))
+* cut long item summaries in the session composer placeholder ([#12312](https://github.com/windmill-labs/windmill/issues/12312)) ([abfa6b1](https://github.com/windmill-labs/windmill/commit/abfa6b1a6743d99858b6923f40a76deb9e6ff063))
+* drop renamed and deleted items from Home recent list ([#12317](https://github.com/windmill-labs/windmill/issues/12317)) ([c144738](https://github.com/windmill-labs/windmill/commit/c1447389e546022f1fb6cd2a18c88480e27ce792))
+* explain why a fork folder deploy can leave a lasting conflict ([#12323](https://github.com/windmill-labs/windmill/issues/12323)) ([6a11d30](https://github.com/windmill-labs/windmill/commit/6a11d3033ad329a730848698d9fa8ddd2cb5563e))
+* keep siblings in place when editing an EditableInput ([#12318](https://github.com/windmill-labs/windmill/issues/12318)) ([5e89ba1](https://github.com/windmill-labs/windmill/commit/5e89ba180e57922a107d840e9fe2b8c00fb2340a))
+* keep the sessions sidebar icons stable until the workspace list loads ([#12322](https://github.com/windmill-labs/windmill/issues/12322)) ([9d7adef](https://github.com/windmill-labs/windmill/commit/9d7adefe23f130168e7e9d77ce4a52c4c4f2223f))
+* load mermaid diagrams without source flashes or layout jumps ([#12319](https://github.com/windmill-labs/windmill/issues/12319)) ([fecc8a6](https://github.com/windmill-labs/windmill/commit/fecc8a6bfd01dacea90bee6d9864527d26cf1714))
+* mark delete and discard tool confirmations as destructive ([#12324](https://github.com/windmill-labs/windmill/issues/12324)) ([949ef23](https://github.com/windmill-labs/windmill/commit/949ef234a841dd18eca661addbf2369329dbc9a3))
+* name agents in session chat tool call labels ([#12313](https://github.com/windmill-labs/windmill/issues/12313)) ([80e2be5](https://github.com/windmill-labs/windmill/commit/80e2be56ddd21cd7f5ea778989e83e09e87b08f5))
+* **python:** give folder modules an empty __path__ so relative imports resolve to workspace scripts ([#12307](https://github.com/windmill-labs/windmill/issues/12307)) ([0323310](https://github.com/windmill-labs/windmill/commit/0323310d6455c361eef2ca857883cdfd888c43ce))
+* read dedicated worker entries with the runnable parser ([#12326](https://github.com/windmill-labs/windmill/issues/12326)) ([df6a61c](https://github.com/windmill-labs/windmill/commit/df6a61c07eabb9845b7ba5a3ef7284df52517445))
+* send AI session requests with their own workspace's AI config ([#12330](https://github.com/windmill-labs/windmill/issues/12330)) ([e8d48b1](https://github.com/windmill-labs/windmill/commit/e8d48b1348893e9396734d0ed4fc4d33049fb0ed))
+* stop forcing the structured output tool for Claude AI agents ([#12331](https://github.com/windmill-labs/windmill/issues/12331)) ([5b4f918](https://github.com/windmill-labs/windmill/commit/5b4f918e0d7742bf09629f0cfe8f90b3038f965e))
+* stream logs of a selected step nested in a subflow or loop ([#12334](https://github.com/windmill-labs/windmill/issues/12334)) ([841cc3e](https://github.com/windmill-labs/windmill/commit/841cc3ecbad7e599086bdb2902fa8c2d4c48e7a6))
+* tighten forwarded http trigger headers and route resolution ([#12298](https://github.com/windmill-labs/windmill/issues/12298)) ([c3adae1](https://github.com/windmill-labs/windmill/commit/c3adae14017cb81cf15549c3f2000eba65e424c0))
+* **worker:** wait up to 3 min for migrations before exiting ([#12316](https://github.com/windmill-labs/windmill/issues/12316)) ([a2685ef](https://github.com/windmill-labs/windmill/commit/a2685ef71880aa9d9745709e5b57f29ff76a85e0))
+
+
+### Performance Improvements
+
+* cut release CI wall time and build windmill-extra on its own release ([#12329](https://github.com/windmill-labs/windmill/issues/12329)) ([7ec64ab](https://github.com/windmill-labs/windmill/commit/7ec64ab33acc56870975c05f24a983bdcd146ee2))
+
+## [1.866.0](https://github.com/windmill-labs/windmill/compare/v1.865.0...v1.866.0) (2026-11-10)
+
+
+### Features
+
+* configurable columns and csv/json/xlsx export on the runs page ([#12302](https://github.com/windmill-labs/windmill/issues/12302)) ([47005d5](https://github.com/windmill-labs/windmill/commit/47005d5fcfe43251b2b184fbe625e7790b9a2adc))
+* show when each job started in the ai session jobs popover ([#12301](https://github.com/windmill-labs/windmill/issues/12301)) ([8b40416](https://github.com/windmill-labs/windmill/commit/8b404164e3487aead898d439de39993e313125be))
+
+
+### Bug Fixes
+
+* keep flow nodes on rename and stop masking flow load errors ([#12303](https://github.com/windmill-labs/windmill/issues/12303)) ([3bf4864](https://github.com/windmill-labs/windmill/commit/3bf486415bd88ffea9787f004874d15bbd433265))
+* never break running flows when their flow is deleted ([#12306](https://github.com/windmill-labs/windmill/issues/12306)) ([e3ff8be](https://github.com/windmill-labs/windmill/commit/e3ff8bee3d1e36c5ed1ea4982e8c6e02e24f7b50))
+* pin rsa to 0.9 so the lock refresh stops pulling 0.10 ([#12299](https://github.com/windmill-labs/windmill/issues/12299)) ([188b6cc](https://github.com/windmill-labs/windmill/commit/188b6ccf151e13aeef6d6a25c565ce59f7f02550))
+* read the git sync callback script with the runnable parser ([#12304](https://github.com/windmill-labs/windmill/issues/12304)) ([2e422b4](https://github.com/windmill-labs/windmill/commit/2e422b497ee6f9691fe14812af1cb3646f928b34))
+
+
+### Performance Improvements
+
+* list audit logs by timestamp so only recent partitions are read ([#12309](https://github.com/windmill-labs/windmill/issues/12309)) ([a6ec7d0](https://github.com/windmill-labs/windmill/commit/a6ec7d0c18c0168bcda1ba6ccc9216b2bd5077a6))
+
 ## [1.865.0](https://github.com/windmill-labs/windmill/compare/v1.864.1...v1.865.0) (2026-11-09)
 
 

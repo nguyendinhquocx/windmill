@@ -41,7 +41,7 @@ jobs:
     if: (github.event_name != 'workflow_dispatch') || (github.event.inputs &&
       !github.event.inputs.ee)
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
@@ -50,7 +50,7 @@ jobs:
         run: |
           echo "ee_repo_ref=$(cat ./backend/ee-repo-ref.txt)" >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v4
         with:
           repository: windmill-labs/windmill-ee-private
           path: ./windmill-ee-private
@@ -60,10 +60,10 @@ jobs:
 
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v2
-      - uses: depot/setup-action@v1.7.2
+      - uses: depot/setup-action@v1
 
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -75,7 +75,7 @@ jobs:
 
       - name: Docker meta
         id: meta-public
-        uses: docker/metadata-action@v5.10.0
+        uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -104,7 +104,7 @@ jobs:
     runs-on: ubicloud
     if: (github.event_name != 'workflow_dispatch') || github.event.inputs.ee
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
@@ -113,7 +113,7 @@ jobs:
         run: |
           echo "ee_repo_ref=$(cat ./backend/ee-repo-ref.txt)" >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v4
         with:
           repository: windmill-labs/windmill-ee-private
           path: ./windmill-ee-private
@@ -123,25 +123,22 @@ jobs:
 
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v2
-      - uses: depot/setup-action@v1.7.2
+      - uses: depot/setup-action@v1
 
       - name: Docker meta
         id: meta-ee-public
-        uses: docker/metadata-action@v5.10.0
+        uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ee
           flavor: |
             latest=false
           tags: |
-            type=raw,value=${{ env.DEV_SHA }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-          labels: |
-            org.opencontainers.image.licenses=Windmill-Enterprise-License
 
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -210,7 +207,7 @@ jobs:
           mv "${{ steps.extract-ee.outputs.destination }}/windmill" "${{ steps.extract-ee.outputs.destination }}/windmill-ee-${ARCH}"
 
       - name: Attach binary to release
-        uses: softprops/action-gh-release@v2.6.2
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ steps.extract.outputs.destination }}/*
@@ -319,7 +316,7 @@ jobs:
     runs-on: ubicloud
     needs: [build_ee]
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
@@ -333,7 +330,7 @@ jobs:
           LICENSE_KEY: ${{ secrets.WM_LICENSE_KEY_CI }}
         run: cd integration_tests && ./run.sh
       - name: Archive logs
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: Windmill Integration Tests Logs
@@ -351,7 +348,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -372,7 +369,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -437,10 +434,10 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2.10.0
+        uses: docker/setup-buildx-action@v2
 
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -457,7 +454,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ee-full:${{ steps.version.outputs.VERSION }}
           path: "/static_frontend/."
 
-      - uses: reggionick/s3-deploy@v4.0.0
+      - uses: reggionick/s3-deploy@v4
         with:
           folder: ${{ steps.extract.outputs.destination }}
           bucket: windmill-frontend
@@ -468,7 +465,7 @@ jobs:
     needs: [build_ee]
     runs-on: ubicloud
     steps:
-      - uses: actions/checkout@v4.4.0
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.ref }}
@@ -476,11 +473,11 @@ jobs:
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v2
 
-      - uses: depot/setup-action@v1.7.2
+      - uses: depot/setup-action@v1
 
       - name: Docker meta
         id: meta-ee-public
-        uses: docker/metadata-action@v5.10.0
+        uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ee-cuda
@@ -489,7 +486,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -520,11 +517,11 @@ jobs:
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v2
 
-      - uses: depot/setup-action@v1.7.2
+      - uses: depot/setup-action@v1
 
       - name: Docker meta
         id: meta-ee-public
-        uses: docker/metadata-action@v5.10.0
+        uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-slim
@@ -533,7 +530,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -564,11 +561,11 @@ jobs:
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v2
 
-      - uses: depot/setup-action@v1.7.2
+      - uses: depot/setup-action@v1
 
       - name: Docker meta
         id: meta-ee-public
-        uses: docker/metadata-action@v5.10.0
+        uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ee-slim
@@ -578,7 +575,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -609,11 +606,11 @@ jobs:
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v2
 
-      - uses: depot/setup-action@v1.7.2
+      - uses: depot/setup-action@v1
 
       - name: Docker meta
         id: meta-public
-        uses: docker/metadata-action@v5.10.0
+        uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-full
@@ -622,7 +619,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -652,11 +649,11 @@ jobs:
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v2
 
-      - uses: depot/setup-action@v1.7.2
+      - uses: depot/setup-action@v1
 
       - name: Docker meta
         id: meta-ee-public
-        uses: docker/metadata-action@v5.10.0
+        uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-ee-full
@@ -665,7 +662,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Login to registry
-        uses: docker/login-action@v3.7.0
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}

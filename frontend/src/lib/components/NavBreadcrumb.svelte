@@ -55,6 +55,7 @@ not this component) — so the lead can run the whole line.
 		section,
 		afterName,
 		actingWorkspaceId,
+		onPickWorkspace,
 		nameOnly = false,
 		stage = BAR_STAGES[0],
 		caps = {},
@@ -68,6 +69,8 @@ not this component) — so the lead can run the whole line.
 		afterName?: Snippet
 		/** The workspace the page acts on, when it differs from the one the app is pointed at. */
 		actingWorkspaceId?: string
+		/** See `PageHeaderContent.onPickWorkspace`. */
+		onPickWorkspace?: (id: string, landOnHome: boolean) => boolean
 		/** Which parts the bar has dropped for room (see pageHeaderStages). */
 		stage?: TrailStage
 		/** Max widths the bar holds the names to, once dropping whole parts is not enough. */
@@ -95,6 +98,10 @@ not this component) — so the lead can run the whole line.
 		const found = navPageFor(page.url.pathname)
 		return found?.path === '/' ? undefined : found
 	})
+	// A page with panes names the pane, not itself, but its picker still files them under it.
+	const pickerPagePath = $derived(
+		routePage?.path ?? (section?.subpages ? navPageFor(page.url.pathname)?.path : undefined)
+	)
 
 	/** One look for every segment, whichever picker it opens. */
 	const SEGMENT =
@@ -283,8 +290,9 @@ not this component) — so the lead can run the whole line.
 
 {#snippet navPicker(measure: boolean)}
 	<!-- The page's own name is the last segment, so the chevron after it moves to a sibling page or
-	     item. Not in a session's preview band, which must not lead out of the host's workspace. -->
-	{#if !nameOnly && !section?.noNavPicker}
+	     item. A session's preview band has the tab's own picker for that, so it shows this one only
+	     on a page with panes, whose name here is the pane's. -->
+	{#if !section?.noNavPicker && (!nameOnly || (section?.subpages && !item))}
 		{#if measure}
 			<span class="flex items-center h-9 px-1.5 shrink-0">
 				<ChevronDown size={ICON} class="flex-shrink-0" />
@@ -292,9 +300,10 @@ not this component) — so the lead can run the whole line.
 		{:else}
 			<BreadcrumbNavPicker
 				{item}
-				pagePath={routePage?.path}
+				pagePath={pickerPagePath}
 				artifacts={section?.navArtifacts}
 				{actingWorkspaceId}
+				subpages={item ? undefined : section?.subpages}
 				iconSize={ICON}
 			/>
 		{/if}
@@ -339,6 +348,7 @@ not this component) — so the lead can run the whole line.
 							<WorkspacePickerBody
 								item={menuItem}
 								collapseFamilies={actingWorkspaceId != undefined}
+								interceptSwitch={onPickWorkspace}
 								closeMenu={() => workspaceMenu?.close()}
 							/>
 						{/snippet}
@@ -517,11 +527,17 @@ not this component) — so the lead can run the whole line.
 	{:else if section}
 		{#if section.parent}
 			<!-- Gives width back with the workspace part, before the section's own name does. -->
-			<span
-				class={twMerge(SEGMENT, LEAD, 'shrink-[999] hover:bg-transparent hover:text-secondary')}
-			>
-				<span class="truncate">{section.parent}</span>
-			</span>
+			{#if section.parentHref && !measure}
+				<a href={section.parentHref} class={twMerge(SEGMENT, LEAD, 'shrink-[999]')}>
+					<span class="truncate">{section.parent}</span>
+				</a>
+			{:else}
+				<span
+					class={twMerge(SEGMENT, LEAD, 'shrink-[999] hover:bg-transparent hover:text-secondary')}
+				>
+					<span class="truncate">{section.parent}</span>
+				</span>
+			{/if}
 			{@render slash()}
 		{/if}
 		{#if section.content && measure}

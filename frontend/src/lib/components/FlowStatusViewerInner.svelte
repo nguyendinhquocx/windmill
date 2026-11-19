@@ -25,7 +25,13 @@
 	import Tabs from './common/tabs/Tabs.svelte'
 	import { type DurationStatus, type FlowStatusViewerContext, type GraphModuleState } from './graph'
 	import ModuleStatus from './ModuleStatus.svelte'
-	import { clone, isScriptPreview, msToSec, readFieldsRecursively, truncateRev } from '$lib/utils'
+	import {
+		clone,
+		isScriptPreview,
+		msToCompactDuration,
+		readFieldsRecursively,
+		truncateRev
+	} from '$lib/utils'
 	import { downloadViaClient, shouldDownloadViaClient } from '$lib/utils/downloadFile'
 	import { appendViewToken } from '$lib/viewToken'
 	import JobArgs from './JobArgs.svelte'
@@ -94,6 +100,7 @@
 					moduleId: string
 					flowJobs: string[]
 					flowJobsSuccess: (boolean | undefined)[]
+					flowJobsLabels?: (string | null)[]
 					flowJobsDuration:
 						| {
 								started_at?: (string | undefined)[]
@@ -692,6 +699,7 @@
 				if (mod.flow_jobs_success || mod.flow_jobs_duration || mod.flow_jobs) {
 					setModuleState(mod.id ?? '', {
 						flow_jobs_success: mod.flow_jobs_success,
+						flow_jobs_labels: mod.flow_jobs_labels,
 						flow_jobs_duration: mod.flow_jobs_duration,
 						flow_jobs: mod.flow_jobs,
 						iteration_total: mod.iterator?.itered_len ?? mod.flow_jobs?.length
@@ -942,16 +950,16 @@
 
 	function getAgentActionContent(agentResult: any, actionIndex: number): unknown | undefined {
 		if (!agentResult?.messages || !Array.isArray(agentResult.messages)) return undefined
-		let agentActionIdx = 0
-		for (const m of agentResult.messages) {
-			if (m.agent_action) {
-				if (agentActionIdx === actionIndex) {
-					return m.content
-				}
-				agentActionIdx++
-			}
-		}
-		return undefined
+		// A background tool's result arrives later as a user message tagged with the action its
+		// job started: it is not an action of its own, and it answers that one.
+		const isBackgroundResult = (m: any) => m.role === 'user' && m.agent_action?.type === 'tool_call'
+		const tagged = agentResult.messages.filter((m: any) => m.agent_action)
+		const message = tagged.filter((m: any) => !isBackgroundResult(m))[actionIndex]
+		const jobId = message?.agent_action?.job_id
+		const result = jobId
+			? tagged.find((m: any) => isBackgroundResult(m) && m.agent_action.job_id === jobId)
+			: undefined
+		return (result ?? message)?.content
 	}
 
 	function isSuccess(arg: any): boolean | undefined {
@@ -1034,6 +1042,7 @@
 						started_at: started_at,
 						flow_jobs: mod.flow_jobs,
 						flow_jobs_success: mod.flow_jobs_success,
+						flow_jobs_labels: mod.flow_jobs_labels,
 						flow_jobs_duration: mod.flow_jobs_duration,
 						iteration_total: mod.iterator?.itered_len,
 						retries: mod?.failed_retries?.length,
@@ -1164,6 +1173,7 @@
 				started_at,
 				flow_jobs: flowJobIds?.flowJobs,
 				flow_jobs_success: flowJobIds?.flowJobsSuccess,
+				flow_jobs_labels: flowJobIds?.flowJobsLabels,
 				flow_jobs_duration: flowJobIds?.flowJobsDuration,
 				iteration_total: flowJobIds?.length,
 				duration_ms: undefined
@@ -1460,6 +1470,8 @@
 	let totalEventsWaiting = $derived(
 		Object.values(suspendStatus?.val ?? {}).reduce((a, b) => a + (b?.nb ?? 0), 0)
 	)
+
+	let continuedOnError = $derived(job?.flow_status?.continued_on_error ?? [])
 </script>
 
 <JobLoader workspaceOverride={workspaceId} {noLogs} noCode bind:this={jobLoader} />
@@ -1474,6 +1486,36 @@
 		{:else}
 			<div class="h-8" />
 		{/if} -->
+		{#if !isListJob && continuedOnError.length > 0}
+			<Alert
+				type="warning"
+				size="xs"
+				title="{continuedOnError.length}{continuedOnError.length >= 100
+					? '+'
+					: ''} step{continuedOnError.length > 1
+					? 's'
+					: ''} failed, the flow continued because of continue on error"
+			>
+				<div class="flex flex-wrap gap-x-3 gap-y-1">
+					<!-- A failure raised before its step's job was created (e.g. a branch predicate
+					     error) carries the nil uuid, so entries are keyed by position. -->
+					{#each continuedOnError as failure, i (i)}
+						{#if isReplay || failure.job == '00000000-0000-0000-0000-000000000000'}
+							<span>{failure.id}</span>
+						{:else}
+							<a
+								rel="noreferrer"
+								target="_blank"
+								href={appendViewToken(`/run/${failure.job}?workspace=${job?.workspace_id}`)}
+							>
+								{failure.id}
+								<ExternalLink size={12} class="inline-block" />
+							</a>
+						{/if}
+					{/each}
+				</div>
+			</Alert>
+		{/if}
 		{#if isListJob}
 			{#if render}
 				<div class="w-full border rounded-sm bg-surface p-1 overflow-auto max-h-[90vh]">
@@ -1634,7 +1676,12 @@
 								}}
 							>
 								<span class="truncate font-mono">
-									#{j + 1}: {loopJobId}
+									#{j + 1}:
+									{#if flowJobIds?.flowJobsLabels?.[j]}
+										{flowJobIds.flowJobsLabels[j]} <span class="text-hint">{loopJobId}</span>
+									{:else}
+										{loopJobId}
+									{/if}
 								</span>
 							</Button>
 						{/if}
@@ -1840,6 +1887,7 @@
 													moduleId: mod.id ?? '',
 													flowJobs: mod.flow_jobs,
 													flowJobsSuccess: mod.flow_jobs_success ?? [],
+													flowJobsLabels: mod.flow_jobs_labels,
 													flowJobsDuration: mod.flow_jobs_duration,
 													length: mod.iterator?.itered_len ?? mod.flow_jobs.length,
 													branchall: job?.raw_flow?.modules?.[i]?.value?.type == 'branchall'
@@ -2289,7 +2337,7 @@
 																		{#if node.duration_ms}
 																			<Badge>
 																				<Hourglass class="mr-2" size={10} />
-																				{msToSec(node.duration_ms)} s
+																				{msToCompactDuration(node.duration_ms)}
 																			</Badge>
 																		{/if}
 																		{#if node.job_id && !isReplay}

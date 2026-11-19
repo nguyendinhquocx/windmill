@@ -47,6 +47,9 @@ use windmill_ai::proxy::{
 };
 use windmill_ai::retry::send_with_retries;
 use windmill_ai::types::{OpenAIContent, OpenAIMessage};
+use windmill_ai::vertex_workload_identity::{
+    check_vertex_base_url, exchange_oidc_token, GcpAccessToken, VertexWorkloadIdentity,
+};
 use windmill_ai::web_search::{WebPage, WebSearchProvider, WebSearchResult};
 use windmill_audit::{audit_oss::audit_log, ActionKind};
 use windmill_common::client::AuthedClient;
@@ -132,6 +135,10 @@ lazy_static::lazy_static! {
     /// federation settings, user email). Like BEDROCK_ASSUMED_ROLE_CACHE, an entry
     /// is never handed to another user than the one the OIDC token named.
     static ref ANTHROPIC_FEDERATED_TOKEN_CACHE: Cache<(String, AnthropicFederation, String), FederatedAccessToken> = Cache::new(500);
+
+    /// Google access tokens from a Vertex Workload Identity Federation exchange,
+    /// keyed like ANTHROPIC_FEDERATED_TOKEN_CACHE by (workspace, settings, user email).
+    static ref VERTEX_WORKLOAD_IDENTITY_TOKEN_CACHE: Cache<(String, VertexWorkloadIdentity, String), GcpAccessToken> = Cache::new(500);
 }
 
 #[cfg(feature = "bedrock")]
@@ -146,6 +153,8 @@ lazy_static::lazy_static! {
 pub(crate) fn invalidate_ai_request_cache_for_workspace(workspace_id: &str) {
     AI_REQUEST_CACHE.retain(|(cached_workspace_id, _), _| cached_workspace_id != workspace_id);
     ANTHROPIC_FEDERATED_TOKEN_CACHE
+        .retain(|(cached_workspace_id, _, _), _| cached_workspace_id != workspace_id);
+    VERTEX_WORKLOAD_IDENTITY_TOKEN_CACHE
         .retain(|(cached_workspace_id, _, _), _| cached_workspace_id != workspace_id);
     // Dropped alongside the credentials that named the role, so that changing a
     // workspace's AI settings does not leave a session assumed under the old ones
@@ -249,6 +258,14 @@ struct AIStandardResource {
     /// Custom HTTP headers to include in AI requests
     #[serde(default)]
     headers: HashMap<String, String>,
+    /// Set only by `vertex_ai_federated` resources, which authenticate to Vertex AI
+    /// through Google Cloud Workload Identity Federation.
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    workload_identity_provider: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    service_account_email: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    workload_identity_audience: Option<String>,
     /// The API token of a `cloudflare` resource, which names it `token` rather than `api_key`.
     #[serde(default, deserialize_with = "empty_string_as_none")]
     token: Option<String>,
@@ -306,6 +323,19 @@ async fn resolve_var(
     match (user_db, authed) {
         (Some(udb), Some(auth)) => Ok(get_variable_or_self_as(path, db, udb, auth, w_id).await?),
         _ => Ok(get_variable_or_self(path, db, w_id).await?),
+    }
+}
+
+async fn resolve_optional_var(
+    value: Option<String>,
+    db: &DB,
+    w_id: &str,
+    user_db: Option<&UserDB>,
+    authed: Option<&ApiAuthed>,
+) -> Result<Option<String>> {
+    match value {
+        Some(value) => Ok(Some(resolve_var(value, db, w_id, user_db, authed).await?)),
+        None => Ok(None),
     }
 }
 
@@ -374,6 +404,41 @@ async fn resolve_provider_credentials(
             } else {
                 None
             };
+            let workload_identity_provider = resolve_optional_var(
+                resource.workload_identity_provider,
+                db,
+                w_id,
+                user_db.as_ref(),
+                authed,
+            )
+            .await?;
+            let service_account_email = resolve_optional_var(
+                resource.service_account_email,
+                db,
+                w_id,
+                user_db.as_ref(),
+                authed,
+            )
+            .await?;
+            let workload_identity_audience = resolve_optional_var(
+                resource.workload_identity_audience,
+                db,
+                w_id,
+                user_db.as_ref(),
+                authed,
+            )
+            .await?;
+            let vertex_workload_identity = VertexWorkloadIdentity::from_resource(
+                provider,
+                workload_identity_provider.as_deref(),
+                service_account_email.as_deref(),
+                workload_identity_audience.as_deref(),
+            )?;
+            let platform = if vertex_workload_identity.is_some() {
+                AIPlatform::GoogleVertexAi
+            } else {
+                resource.platform
+            };
 
             Ok(ProviderCredentials {
                 provider: provider.clone(),
@@ -388,7 +453,8 @@ async fn resolve_provider_credentials(
                 aws_session_token,
                 oidc_role_arn,
                 anthropic_federation: None,
-                platform: resource.platform,
+                vertex_workload_identity,
+                platform,
                 custom_headers: resource.headers,
             })
         }
@@ -427,6 +493,7 @@ async fn resolve_provider_credentials(
                     service_account_id: resource.service_account_id,
                     workspace_id: resource.workspace_id,
                 }),
+                vertex_workload_identity: None,
                 platform: AIPlatform::Standard,
                 custom_headers: HashMap::new(),
             })
@@ -453,6 +520,7 @@ async fn resolve_provider_credentials(
                 aws_session_token: None,
                 oidc_role_arn: None,
                 anthropic_federation: None,
+                vertex_workload_identity: None,
                 platform: AIPlatform::Standard,
                 custom_headers: HashMap::new(),
             })
@@ -672,17 +740,165 @@ async fn mint_anthropic_oidc_token(db: &DB, w_id: &str, authed: &ApiAuthed) -> R
     }
 }
 
+/// Exchange an OIDC token minted for the requesting user for a Google access
+/// token, sent as the Vertex bearer token, when the resource authenticates through
+/// Workload Identity Federation. Runs after the workspace credential cache for the
+/// same reason the Anthropic exchange does: the token names the user.
+async fn resolve_vertex_workload_identity_credentials(
+    db: &DB,
+    w_id: &str,
+    authed: &ApiAuthed,
+    credentials: &mut ProviderCredentials,
+) -> Result<()> {
+    let Some(identity) = credentials.vertex_workload_identity.as_ref() else {
+        return Ok(());
+    };
+    check_vertex_base_url(&credentials.base_url)?;
+
+    let cache_key = (w_id.to_string(), identity.clone(), authed.email.clone());
+    let token = match VERTEX_WORKLOAD_IDENTITY_TOKEN_CACHE
+        .get(&cache_key)
+        .filter(GcpAccessToken::is_fresh)
+    {
+        Some(cached) => cached,
+        None => {
+            let subject_token =
+                mint_vertex_oidc_token(db, w_id, authed, &identity.oidc_audience()).await?;
+            let token = exchange_oidc_token(identity, &subject_token).await?;
+            VERTEX_WORKLOAD_IDENTITY_TOKEN_CACHE.insert(cache_key, token.clone());
+            token
+        }
+    };
+
+    credentials.api_key = Some(token.access_token);
+    Ok(())
+}
+
+async fn mint_vertex_oidc_token(
+    db: &DB,
+    w_id: &str,
+    authed: &ApiAuthed,
+    audience: &str,
+) -> Result<String> {
+    #[cfg(all(feature = "enterprise", feature = "openidconnect", feature = "private"))]
+    {
+        use windmill_ai::vertex_workload_identity::VERTEX_OIDC_TOKEN_LIFETIME_SECS;
+        use windmill_common::oidc_oss::{generate_id_token, OidcCaller, WorkspaceClaim};
+
+        let id_token = generate_id_token(
+            OidcCaller::GoogleVertex,
+            Some(db),
+            WorkspaceClaim { workspace: w_id.to_string() },
+            audience,
+            format!("{}::{}", authed.email, w_id),
+            Some(authed.email.clone()),
+            Some(VERTEX_OIDC_TOKEN_LIFETIME_SECS),
+        )
+        .await?;
+        Ok(id_token.to_string())
+    }
+    #[cfg(not(all(feature = "enterprise", feature = "openidconnect", feature = "private")))]
+    {
+        let _ = (db, w_id, authed, audience);
+        Err(Error::BadRequest(
+            "Vertex AI Workload Identity Federation through Windmill's OIDC provider requires an enterprise license"
+                .to_string(),
+        ))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExpiringProviderCredentials {
     credentials: ProviderCredentials,
+    policy: ModelPolicy,
     expires_at: std::time::Instant,
     instance_ai_config_revision: Option<u64>,
 }
 
+/// The models a request served with the effective AI config's own key may ask one provider
+/// for. The UI only offers what the settings enable; this holds a direct API caller to it.
+#[derive(Clone, Debug, Default)]
+pub struct ModelPolicy {
+    models: std::collections::HashSet<String>,
+}
+
+/// The only fields of a proxied body that are read; the body itself is forwarded unchanged.
+#[derive(Deserialize)]
+struct ProxiedModel {
+    model: String,
+    models: Option<Box<RawValue>>,
+    fallbacks: Option<Box<RawValue>>,
+}
+
+impl ModelPolicy {
+    fn new(config: &AIConfig, provider: &AIProvider) -> Self {
+        let enabled = config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.get(provider))
+            .into_iter()
+            .flat_map(|p| p.models.iter());
+        // Settings allow picking these without enabling them in the provider's list.
+        let picked = [
+            &config.default_model,
+            &config.metadata_model,
+            &config.code_completion_model,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|m| &m.provider == provider)
+        .map(|m| &m.model);
+        // The browser sends a legacy `x/thinking` entry as `x`.
+        let models = enabled
+            .chain(picked)
+            .map(|m| m.strip_suffix("/thinking").unwrap_or(m).to_string())
+            .collect();
+        Self { models }
+    }
+
+    fn check_model(&self, model: &str) -> Result<()> {
+        if self.models.contains(model) {
+            Ok(())
+        } else {
+            Err(Error::BadRequest(format!(
+                "model \"{model}\" is not enabled for this workspace"
+            )))
+        }
+    }
+
+    /// A body-less GET (a model listing) passes; any other request must be a JSON object
+    /// naming an enabled model.
+    fn check_body(&self, method: &Method, body: &Bytes) -> Result<()> {
+        if method == Method::GET && body.is_empty() {
+            return Ok(());
+        }
+        let parsed: ProxiedModel = serde_json::from_slice(body).map_err(|e| {
+            Error::BadRequest(format!(
+                "with the workspace's AI key, the request body must be a JSON object with a string \"model\": {e}"
+            ))
+        })?;
+        // Gateways fall back to the models listed here (OpenRouter `models`, LiteLLM
+        // `fallbacks`), which would run unchecked.
+        for (field, value) in [("models", &parsed.models), ("fallbacks", &parsed.fallbacks)] {
+            if value.is_some() {
+                return Err(Error::BadRequest(format!(
+                    "\"{field}\" (fallback models) is not supported with the workspace's AI key"
+                )));
+            }
+        }
+        self.check_model(&parsed.model)
+    }
+}
+
 impl ExpiringProviderCredentials {
-    fn new(credentials: ProviderCredentials, instance_ai_config_revision: Option<u64>) -> Self {
+    fn new(
+        credentials: ProviderCredentials,
+        policy: ModelPolicy,
+        instance_ai_config_revision: Option<u64>,
+    ) -> Self {
         Self {
             credentials,
+            policy,
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
             instance_ai_config_revision,
         }
@@ -887,16 +1103,17 @@ async fn configured_credentials(
     db: &DB,
     w_id: &str,
     provider: &AIProvider,
-) -> Result<Option<ProviderCredentials>> {
+) -> Result<Option<(ProviderCredentials, ModelPolicy)>> {
     let cache_key = (w_id.to_string(), provider.clone());
     if let Some(cached) = AI_REQUEST_CACHE.get(&cache_key).filter(|c| !c.is_expired()) {
-        return Ok(Some(cached.credentials));
+        return Ok(Some((cached.credentials, cached.policy)));
     }
     let Some((mut ai_config, resource_workspace, instance_ai_config_revision)) =
         effective_ai_config(db, w_id).await?
     else {
         return Ok(None);
     };
+    let policy = ModelPolicy::new(&ai_config, provider);
     let provider_config = ai_config
         .providers
         .as_mut()
@@ -920,9 +1137,13 @@ async fn configured_credentials(
         resolve_provider_credentials(provider, db, &resource_workspace, resource, None).await?;
     AI_REQUEST_CACHE.insert(
         cache_key,
-        ExpiringProviderCredentials::new(credentials.clone(), instance_ai_config_revision),
+        ExpiringProviderCredentials::new(
+            credentials.clone(),
+            policy.clone(),
+            instance_ai_config_revision,
+        ),
     );
-    Ok(Some(credentials))
+    Ok(Some((credentials, policy)))
 }
 
 fn parse_ai_resource(
@@ -1489,7 +1710,7 @@ async fn complete(
 ) -> JsonResult<CompleteResponse> {
     let not_configured =
         || Error::BadRequest("AI is not configured for this workspace".to_string());
-    let model = match request.model {
+    let mut model = match request.model {
         Some(model) => model,
         None => effective_ai_config(&db, &w_id)
             .await?
@@ -1502,18 +1723,23 @@ async fn complete(
                 )
             })?,
     };
+    if let Some(base) = model.model.strip_suffix("/thinking") {
+        model.model = base.to_string();
+    }
     if model.provider.is_decision_provider() {
         return Err(Error::BadRequest(format!(
             "{:?} serves decision models, which answer typed questions rather than messages",
             model.provider
         )));
     }
-    let mut credentials = configured_credentials(&db, &w_id, &model.provider)
+    let (mut credentials, policy) = configured_credentials(&db, &w_id, &model.provider)
         .await?
         .ok_or_else(not_configured)?;
+    policy.check_model(&model.model)?;
     #[cfg(feature = "bedrock")]
     resolve_bedrock_oidc_credentials(&db, &w_id, &authed, &mut credentials).await?;
     resolve_anthropic_federated_credentials(&db, &w_id, &authed, &mut credentials).await?;
+    resolve_vertex_workload_identity_credentials(&db, &w_id, &authed, &mut credentials).await?;
     // The query builders send the api key; only a federated Anthropic token has a way in.
     if credentials.access_token.is_some() && credentials.anthropic_federation.is_none() {
         return Err(Error::BadRequest(format!(
@@ -1624,6 +1850,7 @@ async fn global_proxy(
         aws_session_token: None,
         oidc_role_arn: None,
         anthropic_federation: None,
+        vertex_workload_identity: None,
         platform: AIPlatform::Standard,
         custom_headers: HashMap::new(),
     };
@@ -1786,7 +2013,8 @@ async fn proxy(
             )
             .await?;
         }
-        if let Some(credentials) = configured_credentials(&db, &w_id, &provider).await? {
+        if let Some((credentials, policy)) = configured_credentials(&db, &w_id, &provider).await? {
+            policy.check_body(&method, &body)?;
             break 'cred credentials;
         }
         // Nothing configured: fall back to Windmill's free AI tier (EE-only) if a lent
@@ -1814,6 +2042,7 @@ async fn proxy(
     #[cfg(feature = "bedrock")]
     resolve_bedrock_oidc_credentials(&db, &w_id, &authed, &mut credentials).await?;
     resolve_anthropic_federated_credentials(&db, &w_id, &authed, &mut credentials).await?;
+    resolve_vertex_workload_identity_credentials(&db, &w_id, &authed, &mut credentials).await?;
 
     // Free tier: pin the model and clamp max_tokens server-side before forwarding,
     // since the request body is otherwise client-controlled.
@@ -2023,6 +2252,7 @@ mod tests {
             aws_session_token: None,
             oidc_role_arn: None,
             anthropic_federation: None,
+            vertex_workload_identity: None,
             platform: AIPlatform::Standard,
             custom_headers: HashMap::new(),
         }
@@ -2083,15 +2313,27 @@ mod tests {
         AI_REQUEST_CACHE.clear();
         AI_REQUEST_CACHE.insert(
             ("workspace-a".to_string(), AIProvider::OpenAI),
-            ExpiringProviderCredentials::new(sample_provider_credentials(), None),
+            ExpiringProviderCredentials::new(
+                sample_provider_credentials(),
+                ModelPolicy::default(),
+                None,
+            ),
         );
         AI_REQUEST_CACHE.insert(
             ("workspace-a".to_string(), AIProvider::Anthropic),
-            ExpiringProviderCredentials::new(sample_provider_credentials(), None),
+            ExpiringProviderCredentials::new(
+                sample_provider_credentials(),
+                ModelPolicy::default(),
+                None,
+            ),
         );
         AI_REQUEST_CACHE.insert(
             ("workspace-b".to_string(), AIProvider::OpenAI),
-            ExpiringProviderCredentials::new(sample_provider_credentials(), None),
+            ExpiringProviderCredentials::new(
+                sample_provider_credentials(),
+                ModelPolicy::default(),
+                None,
+            ),
         );
         #[cfg(feature = "bedrock")]
         let assumed_role_key = {
@@ -2128,12 +2370,41 @@ mod tests {
     }
 
     #[test]
+    fn configured_key_serves_only_enabled_models() {
+        let config: AIConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "openai": {"resource_path": "r", "models": ["gpt-4o"]},
+                "anthropic": {"resource_path": "r", "models": ["claude-x"]}
+            },
+            "default_model": {"provider": "openai", "model": "picked/thinking"}
+        }))
+        .unwrap();
+        let policy = ModelPolicy::new(&config, &AIProvider::OpenAI);
+        let check = |body: serde_json::Value| {
+            policy.check_body(&Method::POST, &Bytes::from(body.to_string()))
+        };
+
+        let refused = check(serde_json::json!({"model": "claude-x"})).unwrap_err();
+        assert!(refused.to_string().contains("\"claude-x\" is not enabled"));
+        assert!(check(serde_json::json!({"model": "picked"})).is_ok());
+        assert!(policy.check_body(&Method::GET, &Bytes::new()).is_ok());
+        assert!(policy.check_body(&Method::POST, &Bytes::new()).is_err());
+        assert!(check(serde_json::json!({"model": "gpt-4o", "models": ["other"]})).is_err());
+        assert!(check(serde_json::json!({"model": "gpt-4o", "fallbacks": ["other"]})).is_err());
+        assert!(check(serde_json::json!({"messages": []})).is_err());
+        assert!(policy
+            .check_body(&Method::POST, &Bytes::from_static(b"--boundary"))
+            .is_err());
+    }
+
+    #[test]
     fn instance_backed_cache_entries_expire_when_revision_changes() {
         let _guard = TEST_LOCK.lock().unwrap();
         AI_REQUEST_CACHE.clear();
 
         let cached = ExpiringProviderCredentials::new(
             sample_provider_credentials(),
+            ModelPolicy::default(),
             Some(current_instance_ai_config_revision()),
         );
         assert!(!cached.is_expired());

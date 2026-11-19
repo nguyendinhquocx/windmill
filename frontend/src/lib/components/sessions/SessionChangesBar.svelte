@@ -29,7 +29,13 @@
 	import { UserDraftDbSyncer } from '$lib/userDraftDbSyncer.svelte'
 	import { maskKey } from './modifiedItemsMask'
 	import { removeHandEdit, renameHandEdit, sessionHandEdits } from './sessionHandEdits.svelte'
-	import { badgeCounts, badgeOf, buildDeployItems, type DeployItem } from './sessionDeployModel'
+	import {
+		badgeCounts,
+		badgeOf,
+		buildDeployItems,
+		editsToken,
+		type DeployItem
+	} from './sessionDeployModel'
 	import { useExistingMaskKeys } from './sessionDeployModel.svelte'
 	import { previewTargetForDeployKind } from './sessionPreviewTabs.svelte'
 	import { PIPELINE_DRAFT_KIND, pipelineFolderFromBundlePath } from '$lib/pipelinePaths'
@@ -186,11 +192,11 @@
 			: []
 	)
 	const dockCounts = $derived(badgeCounts(dockItems))
-	// An agent is a resource the draft list cannot tell apart, but it has an icon of its own.
+	// A draft row says whether it is an agent's; a deployed row with no draft left is read for it.
 	// Keyed on the joined paths so a re-derived list doesn't re-fetch.
 	const resourcePaths = $derived(
 		dockItems
-			.filter((i) => i.deployKind === 'resource')
+			.filter((i) => i.deployKind === 'resource' && !i.hasDraft)
 			.map((i) => i.path)
 			.join('\n')
 	)
@@ -210,7 +216,7 @@
 		}
 	)
 	const isAgentRow = (item: DeployItem) =>
-		item.deployKind === 'resource' && (agentPaths.current?.has(item.path) ?? false)
+		item.agent || (item.deployKind === 'resource' && (agentPaths.current?.has(item.path) ?? false))
 
 	// Deletion-only fork chat: the mask has entries but every one failed the
 	// (resolved) existence check — the chat's edits were deletions, which have no
@@ -246,11 +252,7 @@
 
 	// Drafts are what still needs action, so the token counts only them while any
 	// are pending; once none are left it turns green and counts the deployed.
-	const editsLabel = $derived(
-		dockCounts.draft > 0
-			? `${dockCounts.draft} draft${dockCounts.draft === 1 ? '' : 's'}`
-			: `${dockCounts.deployed} deployed`
-	)
+	const editsLabel = $derived(editsToken(dockCounts).label)
 	let editsOpen = $state(false)
 
 	// Routed on the storage `path` — the edit route's key, which for a draft-only
@@ -299,11 +301,7 @@
 
 	// Only draft-vs-deployed drives the color: stale/failed live in the drawer's
 	// deploy model, not here.
-	const editsColorClass = $derived(
-		dockCounts.draft > 0
-			? '!bg-indigo-100 !text-indigo-800 hover:!bg-indigo-200 dark:!bg-indigo-700/40 dark:!text-indigo-100 dark:hover:!bg-indigo-600/40'
-			: '!bg-green-100 !text-green-700 hover:!bg-green-200 dark:!bg-green-700/40 dark:!text-green-100 dark:hover:!bg-green-600/40'
-	)
+	const editsColorClass = $derived(editsToken(dockCounts).class)
 </script>
 
 {#if committedId && isUnavailable}

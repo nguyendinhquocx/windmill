@@ -960,6 +960,14 @@ pub struct AgentTool {
     /// Flow module and MCP tools only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_approval: bool,
+    /// The agent is answered as soon as the tool's job starts, and gets its result in a later
+    /// message once it finishes. Only a flow module tool can run in the background.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
+    /// With `background` unset, the agent waits this many seconds for the tool's job, then is
+    /// answered as for a background tool. Flow module tools only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_after_secs: Option<u32>,
     pub value: ToolValue,
 }
 
@@ -1105,6 +1113,10 @@ pub enum FlowModuleValue {
         parallelism: Option<InputTransform>,
         #[serde(skip_serializing_if = "Option::is_none")]
         squash: Option<bool>,
+        /// Evaluated once per iteration, with `flow_input.iter` set, into the text the run
+        /// viewers show for that iteration. Never fails the iteration.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iteration_label: Option<InputTransform>,
     },
     WhileloopFlow {
         modules: Vec<FlowModule>,
@@ -1231,6 +1243,7 @@ struct UntaggedFlowModuleValue {
     tool_inputs: Option<HashMap<String, HashMap<String, InputTransform>>>,
     pass_flow_input_directly: Option<bool>,
     squash: Option<bool>,
+    iteration_label: Option<InputTransform>,
     max_iterations: Option<u32>,
     max_duration_secs: Option<u32>,
     #[serde(flatten)]
@@ -1274,6 +1287,7 @@ impl<'de> Deserialize<'de> for FlowModuleValue {
                 parallel: untagged.parallel.unwrap_or(false),
                 parallelism: untagged.parallelism,
                 squash: untagged.squash,
+                iteration_label: untagged.iteration_label,
             }),
             "whileloopflow" => Ok(FlowModuleValue::WhileloopFlow {
                 modules: untagged

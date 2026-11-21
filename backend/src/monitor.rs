@@ -3079,6 +3079,10 @@ pub async fn reload_npm_config_registry_setting(conn: &Connection) {
     .await;
 }
 
+pub async fn reload_npmrc_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(conn, NPMRC_SETTING, "NPMRC", NPMRC.clone()).await;
+}
+
 pub async fn reload_bunfig_install_scopes_setting(conn: &Connection) {
     reload_option_setting_with_tracing(
         conn,
@@ -3184,6 +3188,16 @@ pub fn apply_no_default_maven_setting(value: Option<serde_json::Value>) {
     if let Some(serde_json::Value::Bool(t)) = value {
         NO_DEFAULT_MAVEN.store(t, Ordering::Relaxed)
     }
+}
+
+pub async fn reload_cargo_registries_setting(conn: &Connection) {
+    reload_option_setting_with_tracing(
+        conn,
+        windmill_common::global_settings::CARGO_REGISTRIES_SETTING,
+        "CARGO_REGISTRIES",
+        CARGO_REGISTRIES.clone(),
+    )
+    .await;
 }
 
 pub async fn reload_ruby_repos_setting(conn: &Connection) {
@@ -5360,7 +5374,7 @@ async fn poll_git_auto_pull_inner(db: &Pool<Postgres>) -> error::Result<()> {
                 Ok(Some((git_ref, sha))) => {
                     // Shared reconcile (also used by the webhook receiver):
                     // checks should_pull, enqueues, and records status/failure.
-                    if let Err(e) = windmill_git_sync::reconcile_and_enqueue_pull(
+                    match windmill_git_sync::reconcile_and_enqueue_pull(
                         db,
                         &row.workspace_id,
                         repo,
@@ -5370,11 +5384,48 @@ async fn poll_git_auto_pull_inner(db: &Pool<Postgres>) -> error::Result<()> {
                     )
                     .await
                     {
-                        tracing::warn!(
-                            "git auto-pull: reconcile failed for {}/{}: {e:#}",
-                            row.workspace_id,
-                            repo.git_repo_resource_path
-                        );
+                        // The webhook should have brought this head already: it stopped
+                        // reaching us, so poll every minute again until it delivers. Not for
+                        // a ref's first sync, which no delivery could have brought, nor after
+                        // a failed pull: its rollback re-offers a head the webhook did deliver,
+                        // and demoting would retry the failing pull every minute.
+                        Ok(Some(_))
+                            if auto_pull.webhook_verified()
+                                && auto_pull.last_synced_sha.contains_key(&git_ref)
+                                && auto_pull
+                                    .last_pull_status
+                                    .as_ref()
+                                    .map_or(true, |s| s.success) =>
+                        {
+                            tracing::warn!(
+                                "git auto-pull: {}/{} moved without a webhook delivery, polling every minute until one arrives",
+                                row.workspace_id,
+                                repo.git_repo_resource_path
+                            );
+                            if let Err(e) =
+                                windmill_common::workspaces::set_auto_pull_webhook_verified_id(
+                                    db,
+                                    &row.workspace_id,
+                                    &repo.git_repo_resource_path,
+                                    None,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "git auto-pull: could not record the missed delivery for {}/{}: {e:#}",
+                                    row.workspace_id,
+                                    repo.git_repo_resource_path
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                "git auto-pull: reconcile failed for {}/{}: {e:#}",
+                                row.workspace_id,
+                                repo.git_repo_resource_path
+                            );
+                        }
                     }
 
                     // Parent-managed fork sync: list the fork branches' heads in

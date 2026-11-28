@@ -6908,6 +6908,9 @@ async fn set_encryption_key(
         &new_encryption_key,
     )
     .await?;
+    if w_id == "admins" {
+        reencrypt_totp_secrets(&mut tx, &previous_encryption_key, &new_encryption_key).await?;
+    }
 
     tx.commit().await?;
 
@@ -6944,6 +6947,45 @@ async fn set_encryption_key(
     .await?;
 
     return Ok(());
+}
+
+/// Two-factor secrets of password logins are kept under the `admins` workspace key. Never
+/// synced, so they move to the new key even when the caller skips re-encryption: one left under
+/// the old key would lock its user out.
+async fn reencrypt_totp_secrets(
+    conn: &mut sqlx::PgConnection,
+    old: &windmill_common::variables::WorkspaceCrypt,
+    new: &windmill_common::variables::WorkspaceCrypt,
+) -> Result<()> {
+    let rows = sqlx::query!(
+        "SELECT email, totp_secret, totp_pending_secret FROM password
+         WHERE totp_secret IS NOT NULL OR totp_pending_secret IS NOT NULL FOR UPDATE"
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    // Left as is when it does not decrypt: dropping it would switch the second factor off.
+    let reencrypt = |email: &str, value: Option<String>| {
+        value.map(|v| match decrypt(old, v.clone()) {
+            Ok(plain) => encrypt(new, &plain),
+            Err(e) => {
+                tracing::warn!("the two-factor secret of {email} does not decrypt under the current key, leaving it as is: {e}");
+                v
+            }
+        })
+    };
+    for row in rows {
+        let secret = reencrypt(&row.email, row.totp_secret);
+        let pending = reencrypt(&row.email, row.totp_pending_secret);
+        sqlx::query!(
+            "UPDATE password SET totp_secret = $2, totp_pending_secret = $3 WHERE email = $1",
+            row.email,
+            secret,
+            pending
+        )
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Move the git-sync secrets the server keeps under the workspace key (stored
@@ -11288,7 +11330,8 @@ async fn attach_dev_workspace(
     )
     .fetch_optional(&db)
     .await?
-    .unwrap_or(false);
+    .unwrap_or(false)
+        && !authed.admin_withheld;
     if !is_admin_of_dev && !windmill_api_auth::is_super_admin_authed(&db, &authed).await? {
         return Err(Error::PermissionDenied(format!(
             "Attaching workspace '{dev_w_id}' as a dev requires being an admin of it (or a superadmin)"
@@ -11816,7 +11859,8 @@ async fn archive_workspace(
         )
         .fetch_optional(&db)
         .await?
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && !authed.admin_withheld;
         if !is_prod_admin && !windmill_api_auth::is_super_admin_authed(&db, &authed).await? {
             return Err(Error::PermissionDenied(format!(
                 "Archiving dev workspace '{w_id}' requires being an admin of its parent prod workspace '{prod}' (or a superadmin)"
@@ -14470,6 +14514,8 @@ async fn load_workspace_authed(
             mcp_client: base_authed.mcp_client.clone(),
             capabilities: None,
             allowed_ips: None,
+            admin_withheld: base_authed.admin_withheld,
+            super_admin_withheld: base_authed.super_admin_withheld,
         });
     };
 
@@ -14491,7 +14537,7 @@ async fn load_workspace_authed(
     Ok(ApiAuthed {
         email: base_authed.email.clone(),
         username: user_row.username,
-        is_admin: is_super_admin || user_row.is_admin,
+        is_admin: is_super_admin || (user_row.is_admin && !base_authed.admin_withheld),
         is_operator: !user_row.is_admin
             && windmill_common::roles::member_is_restricted(
                 &mut conn,
@@ -14513,6 +14559,8 @@ async fn load_workspace_authed(
         mcp_client: base_authed.mcp_client.clone(),
         capabilities: None,
         allowed_ips: None,
+        admin_withheld: base_authed.admin_withheld,
+        super_admin_withheld: base_authed.super_admin_withheld,
     })
 }
 

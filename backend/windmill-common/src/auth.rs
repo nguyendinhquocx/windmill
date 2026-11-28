@@ -30,6 +30,8 @@ use crate::{
 /// - the `update_token_label` editability guard (SQL `WHERE`) in
 ///   windmill-api-users/src/users.rs
 /// - `isUserToken` in frontend/src/lib/components/settings/TokensTable.svelte
+/// - `self_managed` in the `token_risk` view (a migration), for a label the server also expires or
+///   renews on its own
 pub fn is_user_token(label: Option<&str>) -> bool {
     match label {
         None => true,
@@ -346,6 +348,13 @@ pub struct JWTAuthClaims {
     /// records the client on the runs it starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_client: Option<String>,
+    /// The rights the credential this JWT was minted from withholds from its owner (a token's
+    /// `admin` / `super_admin`), which `is_admin` alone cannot carry: superadmin gates key off
+    /// the email, and `tokens/create` would otherwise mint them back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin_withheld: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub super_admin_withheld: bool,
 }
 
 impl JWTAuthClaims {
@@ -842,6 +851,31 @@ pub async fn create_jwt_token(
     audit_span: Option<String>,
     scopes: Option<Vec<String>>,
 ) -> crate::error::Result<String> {
+    create_jwt_token_withholding(
+        authed,
+        workspace_id,
+        expires_in_seconds,
+        job_id,
+        label,
+        audit_span,
+        scopes,
+        (false, false),
+    )
+    .await
+}
+
+/// [`create_jwt_token`] for a JWT minted from a caller's credential, carrying the
+/// `(admin, super_admin)` rights that credential withholds.
+pub async fn create_jwt_token_withholding(
+    authed: Authed,
+    workspace_id: &str,
+    expires_in_seconds: u64,
+    job_id: Option<Uuid>,
+    label: Option<String>,
+    audit_span: Option<String>,
+    scopes: Option<Vec<String>>,
+    (admin_withheld, super_admin_withheld): (bool, bool),
+) -> crate::error::Result<String> {
     let payload = JWTAuthClaims {
         email: authed.email.clone(),
         username: authed.username.clone(),
@@ -858,6 +892,8 @@ pub async fn create_jwt_token(
         scopes,
         audit_span,
         mcp_client: authed.mcp_client.clone(),
+        admin_withheld,
+        super_admin_withheld,
     };
 
     let token = jwt::encode_with_internal_secret(&payload)
@@ -997,6 +1033,8 @@ mod tests {
             scopes: None,
             audit_span: None,
             mcp_client: None,
+            admin_withheld: false,
+            super_admin_withheld: false,
         };
         // Signature is irrelevant — the gate decodes without verifying — so any key works.
         let token = jsonwebtoken::encode(

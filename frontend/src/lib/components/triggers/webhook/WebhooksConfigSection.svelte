@@ -18,11 +18,12 @@
 	import { apiBaseUrl } from '$lib/apiBaseUrl.svelte'
 	import TriggerTokens from '../TriggerTokens.svelte'
 	import { userStore } from '$lib/stores'
-	import UserSettings from '../../UserSettings.svelte'
+	import TokensDrawer from '$lib/components/account/TokensDrawer.svelte'
 	import { generateRandomString } from '$lib/utils'
 	import TextInput from '$lib/components/text_input/TextInput.svelte'
 	import { useOperatingWorkspace } from '$lib/components/operatingWorkspace.svelte'
 	import CollapseLink from '$lib/components/CollapseLink.svelte'
+	import TokenInspector from '$lib/components/settings/TokenInspector.svelte'
 	import CopyableCodeBlock from '$lib/components/details/CopyableCodeBlock.svelte'
 	import { markdown } from 'svelte-highlight/languages'
 	import {
@@ -86,10 +87,22 @@
 		}
 	})
 
+	/** The route the token test checks: the by-path form of the one the examples call. A by-hash
+	 * or by-version route is gated by the same runnable scope, which the check only resolves
+	 * from a path. */
+	const webhookRoutePath = $derived.by(() => {
+		const base = `/api/w/${wsId}/jobs`
+		if (agent) return `${base}/run/agent/${path}`
+		const endpoint =
+			requestType == 'async' ? 'run' : requestType == 'sync' ? 'run_wait_result' : 'run_and_stream'
+		return `${base}/${endpoint}/${isFlow ? 'f' : 'p'}/${path}`
+	})
+	let tokenTestOpen = $state(false)
+
 	let surface = $state('http') as 'http' | 'sdk'
 	let example = $state('rest') as 'rest' | 'curl' | 'fetch'
 	let promptOpen = $state(false)
-	let userSettings: UserSettings | undefined = $state()
+	let userSettings: TokensDrawer | undefined = $state()
 	let requestType = $state(DEFAULT_WEBHOOK_TYPE) as 'async' | 'sync' | 'sync_sse'
 	let callMethod = $state('post') as 'get' | 'post'
 	let runnableId = $state('path') as 'runnableVersion' | 'path'
@@ -335,10 +348,10 @@ done`
 	}
 </script>
 
-<UserSettings
+<TokensDrawer
 	bind:this={userSettings}
-	on:tokenCreated={(e) => {
-		token = e.detail
+	onTokenCreated={(newToken) => {
+		token = newToken
 		triggerTokens?.listTokens()
 	}}
 	newTokenWorkspace={wsId}
@@ -362,6 +375,18 @@ done`
 						safe to share as it cannot be used to impersonate you.
 					</Tooltip>
 				</Button>
+			</div>
+			<div class="mt-2">
+				<CollapseLink text="Test this token" bind:open={tokenTestOpen}>
+					{#key `${callMethod} ${webhookRoutePath}`}
+						<TokenInspector
+							{token}
+							workspace={wsId}
+							defaultPath={webhookRoutePath}
+							defaultMethod={callMethod.toUpperCase()}
+						/>
+					{/key}
+				</CollapseLink>
 			</div>
 		</Label>
 	{/if}

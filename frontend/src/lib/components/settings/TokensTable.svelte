@@ -2,8 +2,10 @@
 	import { untrack } from 'svelte'
 	import TableCustom from '$lib/components/TableCustom.svelte'
 	import { displayDate } from '$lib/utils'
-	import { enterpriseLicense } from '$lib/stores'
-	import { UserService, type TruncatedToken } from '$lib/gen'
+	import { enterpriseLicense, workspaceStore } from '$lib/stores'
+	import CollapseLink from '../CollapseLink.svelte'
+	import TokenInspector from './TokenInspector.svelte'
+	import { UserService, type TokenRisk, type TokenRiskCounts, type TruncatedToken } from '$lib/gen'
 	import { sendUserToast } from '$lib/toast'
 	import CreateToken from './CreateToken.svelte'
 	import EditTokenScopesModal from './EditTokenScopesModal.svelte'
@@ -12,25 +14,17 @@
 	import Alert from '../common/alert/Alert.svelte'
 	import { Pen, Trash } from 'lucide-svelte'
 	import { MCP_SESSION } from '../mcp/McpAccessPicker.svelte'
+	import { tokenRiskSummary, TOKEN_RISK_INFO } from './tokenRisks'
 
 	// --- Props ---
 	interface Props {
-		showMcpMode?: boolean
-		openWithMcpMode?: boolean
 		defaultNewTokenLabel?: string
 		defaultNewTokenWorkspace?: string
 		scopes?: string[]
 		onTokenCreated: (token: string) => void
 	}
 
-	let {
-		showMcpMode = false,
-		openWithMcpMode = false,
-		defaultNewTokenLabel,
-		defaultNewTokenWorkspace,
-		scopes,
-		onTokenCreated
-	}: Props = $props()
+	let { defaultNewTokenLabel, defaultNewTokenWorkspace, scopes, onTokenCreated }: Props = $props()
 
 	// --- Local State ---
 	let tokens = $state<TruncatedToken[]>([])
@@ -42,10 +36,13 @@
 				label: string | undefined
 				scopes: string[] | undefined
 				workspaceId: string | undefined
+				expiration: string | undefined
+				allowedIps: string[] | undefined
 		  }
 		| undefined
 	>(undefined)
 	let editModalOpen = $state(false)
+	let testOpen = $state(false)
 
 	$effect(() => {
 		listTokens()
@@ -105,6 +102,15 @@
 		}).length
 	)
 
+	// Over all the user's tokens, not only the page shown.
+	let riskCounts: TokenRiskCounts | undefined = $state(undefined)
+	let riskSummary = $derived(tokenRiskSummary(riskCounts))
+
+	// The access column already shows a token's workspace and rights.
+	function rowBadgeRisks(risks: TokenRisk[]): TokenRisk[] {
+		return risks.filter((r) => r === 'never_expires' || r === 'unused')
+	}
+
 	function handleTokenCreated(token: string) {
 		onTokenCreated(token)
 		listTokens()
@@ -124,23 +130,26 @@
 		tokenPrefix: string,
 		tokenLabel: string | undefined,
 		tokenScopes: string[] | undefined,
-		tokenWorkspaceId: string | undefined
+		tokenWorkspaceId: string | undefined,
+		tokenExpiration: string | undefined,
+		tokenAllowedIps: string[] | undefined
 	) {
 		editingToken = {
 			prefix: tokenPrefix,
 			label: tokenLabel,
 			scopes: tokenScopes,
-			workspaceId: tokenWorkspaceId
+			workspaceId: tokenWorkspaceId,
+			expiration: tokenExpiration,
+			allowedIps: tokenAllowedIps
 		}
 		editModalOpen = true
 	}
 
 	export async function listTokens(): Promise<void> {
-		tokens = await UserService.listTokens({
-			excludeEphemeral: true,
-			page: tokenPage,
-			perPage: 100
-		})
+		;[tokens, riskCounts] = await Promise.all([
+			UserService.listTokens({ excludeEphemeral: true, page: tokenPage, perPage: 100 }),
+			UserService.getTokenRiskCounts()
+		])
 	}
 
 	function handleNextPage() {
@@ -154,11 +163,24 @@
 	}
 </script>
 
-<div class="flex flex-col p-4 border border-border-light rounded-md">
-	<h2 class="text-emphasis text-sm font-semibold mb-1">Tokens</h2>
+<div class="flex flex-col">
 	<div class="text-xs text-secondary mb-2">
 		Authenticate to the Windmill API with access tokens.
 	</div>
+	{#if riskSummary.length > 0}
+		<div class="mb-2">
+			<Alert type="warning" title="Some of your tokens need a review" size="xs">
+				<ul class="list-disc pl-4">
+					{#each riskSummary as line (line)}
+						<li>{line}</li>
+					{/each}
+				</ul>
+				A leaked token keeps working until it expires or is deleted. Delete tokens you no longer use,
+				and give the ones you keep an expiration, the narrowest scopes they need and no admin rights
+				unless they require them.
+			</Alert>
+		</div>
+	{/if}
 	{#if expiringSoonCount > 0}
 		<div class="mb-2">
 			<Alert
@@ -169,8 +191,6 @@
 		</div>
 	{/if}
 	<CreateToken
-		{showMcpMode}
-		{openWithMcpMode}
 		bind:newTokenLabel
 		{defaultNewTokenWorkspace}
 		{scopes}
@@ -183,6 +203,7 @@
 					<th>Prefix</th>
 					<th>Label</th>
 					<th>Expiration</th>
+					<th>Access</th>
 					<th>Scopes</th>
 					<th></th>
 				</tr>
@@ -190,16 +211,46 @@
 			{#snippet body()}
 				<tbody>
 					{#if tokens && tokens.length > 0}
-						{#each tokens as { token_prefix, expiration, label, scopes, workspace_id, read_only, allowed_ips } (token_prefix)}
+						{#each tokens as { token_prefix, expiration, label, scopes, workspace_id, read_only, allowed_ips, admin, super_admin, risks } (token_prefix)}
+							{@const rowRisks = rowBadgeRisks(risks)}
 							{@const badge = expirationBadge(expiration, label)}
 							<tr>
 								<td class="w-32 text-xs text-primary">{token_prefix}****</td>
-								<td class="min-w-0 max-w-32 truncate text-xs text-primary">{label ?? ''}</td>
+								<td class="min-w-0 max-w-40 text-xs text-primary">
+									<div class="truncate">{label ?? ''}</div>
+									{#if rowRisks.length > 0}
+										<div class="flex flex-wrap gap-1 mt-0.5">
+											{#each rowRisks as risk (risk)}
+												<span title={TOKEN_RISK_INFO[risk].tooltip}>
+													<Badge color={TOKEN_RISK_INFO[risk].color} small>
+														{TOKEN_RISK_INFO[risk].badge}
+													</Badge>
+												</span>
+											{/each}
+										</div>
+									{/if}
+								</td>
 								<td class="w-40 whitespace-nowrap text-xs text-secondary">
 									<div class="flex items-center gap-1.5">
 										{displayDate(expiration ?? '')}
 										{#if badge}
 											<Badge color={badge.color} small>{badge.text}</Badge>
+										{/if}
+									</div>
+								</td>
+								<td class="whitespace-nowrap text-xs text-secondary">
+									<div class="flex items-center gap-1.5">
+										<span
+											title={workspace_id
+												? `Usable only in workspace ${workspace_id}`
+												: 'Usable in every workspace you are a member of'}
+										>
+											{workspace_id ?? 'All workspaces'}
+										</span>
+										{#if super_admin}
+											<Badge color="red" small>Superadmin</Badge>
+										{:else if admin}
+											<Badge color="indigo" small>Admin</Badge>
 										{/if}
 									</div>
 								</td>
@@ -233,7 +284,9 @@
 													token_prefix,
 													label ?? undefined,
 													scopes ?? undefined,
-													workspace_id ?? undefined
+													workspace_id ?? undefined,
+													expiration ?? undefined,
+													allowed_ips ?? undefined
 												)}
 											size="xs"
 											startIcon={{ icon: Pen }}
@@ -270,6 +323,16 @@
 			{/if}
 		</div>
 	</div>
+	<div class="mt-4">
+		<CollapseLink text="Test a token" bind:open={testOpen}>
+			<div class="text-xs text-secondary mb-2">
+				See who a token acts as, what it is scoped to and whether it can call a route{$workspaceStore
+					? ` in ${$workspaceStore}`
+					: ''}.
+			</div>
+			<TokenInspector workspace={$workspaceStore} />
+		</CollapseLink>
+	</div>
 </div>
 
 <EditTokenScopesModal
@@ -279,5 +342,7 @@
 	labelEditable={isUserToken(editingToken?.label)}
 	initialScopes={editingToken?.scopes}
 	tokenWorkspaceId={editingToken?.workspaceId}
+	initialExpiration={editingToken?.expiration}
+	initialAllowedIps={editingToken?.allowedIps}
 	onSaved={listTokens}
 />

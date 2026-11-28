@@ -42,7 +42,14 @@
 	import { sameTopDomainOrigin } from '$lib/cookies'
 	import { isValidLogoutRedirect, toSameOriginRelativePath } from '$lib/logoutRedirect'
 	import InputError from './InputError.svelte'
-	import { loginErrorMessage } from '$lib/loginError'
+	import {
+		loginErrorDetail,
+		loginErrorMessage,
+		TOTP_INVALID_MESSAGE,
+		TOTP_REQUIRED,
+		TOTP_SETUP_REQUIRED
+	} from '$lib/loginError'
+	import { parseAccountSettingsHash } from './sidebar/settings'
 	import Badge from './common/badge/Badge.svelte'
 	import {
 		getLastLoginMethod,
@@ -78,6 +85,9 @@
 		 * same sign-in without this, which provisions them for real. Password login
 		 * ignores it: a guest has no stored credential to check. */
 		guestApp?: string | undefined
+		/** Once a password login succeeds, offer to set up two-factor authentication before
+		 * leaving the card, for an account that has none. The user can skip it. */
+		offerTotpSetup?: boolean
 	}
 
 	let {
@@ -92,7 +102,8 @@
 		onLoginError = undefined,
 		preview = undefined,
 		onOptionsLoaded = undefined,
-		guestApp = undefined
+		guestApp = undefined,
+		offerTotpSetup = false
 	}: Props = $props()
 
 	// The harness never takes effect in a production bundle, whatever a caller passes.
@@ -108,6 +119,7 @@
 	const emailId = `${uid}-email`
 	const passwordId = `${uid}-password`
 	const errorId = `${uid}-error`
+	const totpId = `${uid}-totp`
 	const emailErrorId = `${uid}-email-error`
 
 	const providers = [
@@ -182,6 +194,43 @@
 
 	let showPassword = $state(false)
 	let passwordField = $state<Password | undefined>(undefined)
+	// The account the server asked an authenticator code for, or asked to set up two-factor
+	// authentication when the instance requires it. These steps replace the form and resend the
+	// password kept here, so the server needs no half-logged-in state.
+	let totpFor = $state<string | undefined>(undefined)
+	let totpCode = $state('')
+	let totpField = $state<TextInput | undefined>(undefined)
+	let showTotp = $derived(totpFor !== undefined && totpFor === email)
+	let enrollSetup = $state<{ secret: string; otpauth_url: string } | undefined>(undefined)
+	// Kept across Back: asking the server again replaces the pending secret, and the QR code the
+	// user already scanned would stop working.
+	let issuedSetup: { email: string; setup: { secret: string; otpauth_url: string } } | undefined
+	let enrollCodes = $state<string[] | undefined>(undefined)
+	// The setup was offered after a successful login, rather than required before one: a
+	// session exists, so it goes through the signed-in routes and can be skipped.
+	let enrollOptional = $state(false)
+	let enrollSaved = $state(false)
+
+	async function openTotpStep(forEmail: string, setup?: { secret: string; otpauth_url: string }) {
+		formError = undefined
+		shake = false
+		totpFor = forEmail
+		totpCode = ''
+		enrollSetup = setup
+		await tick()
+		totpField?.focus()
+	}
+
+	async function leaveTotp() {
+		totpFor = undefined
+		totpCode = ''
+		enrollSetup = undefined
+		formError = undefined
+		// The swapped-in markup would otherwise replay a shake left on from a failed attempt.
+		shake = false
+		await tick()
+		passwordField?.focus()
+	}
 	// Type argument rather than annotation: annotating narrows the declaration to the
 	// initializer's `undefined`, so a top-level read sees `never` instead of the array.
 	let logins = $state<OAuthLogin[] | undefined>(undefined)
@@ -199,7 +248,7 @@
 	let formError = $state<
 		| {
 				message: string
-				fields: 'both' | 'email' | 'password'
+				fields: 'both' | 'email' | 'password' | 'totp'
 				email: string | undefined
 				password: string | undefined
 		  }
@@ -220,7 +269,7 @@
 
 	async function failLogin(
 		message: string,
-		fields: 'both' | 'email' | 'password' = 'both',
+		fields: 'both' | 'email' | 'password' | 'totp' = 'both',
 		// The pair the message is about. Defaults to what is in the fields right now, but a
 		// rejected request passes what it actually submitted: the user may have typed on since.
 		attempted: { email: string | undefined; password: string | undefined } = { email, password }
@@ -244,7 +293,20 @@
 		displayName: string
 	}
 
+	// One submit at a time: a second setup request would replace the pending secret, and the
+	// page could then show a QR code the server no longer accepts.
+	let submitting = false
 	async function login(): Promise<void> {
+		if (submitting) return
+		submitting = true
+		try {
+			await submitLogin()
+		} finally {
+			submitting = false
+		}
+	}
+
+	async function submitLogin(): Promise<void> {
 		if (!email || !password) {
 			if (!email && !password) failLogin('Enter both your email and password.')
 			else if (!email) failLogin('Enter your email.', 'email')
@@ -257,9 +319,20 @@
 			return
 		}
 
+		if (showTotp && !totpCode.trim()) {
+			failLogin('Enter the code from your authenticator app.', 'totp')
+			return
+		}
+
+		if (showTotp && enrollSetup) {
+			await enableTotpAtLogin()
+			return
+		}
+
 		const requestBody = {
 			email,
-			password
+			password,
+			totp_code: showTotp ? totpCode : undefined
 		}
 
 		// Await the DOM update: the field must be back to type="password" before the
@@ -273,10 +346,66 @@
 			// previous account must not be served to this one.
 			noteSessionEmail(email)
 		} catch (err) {
-			failLogin(loginErrorMessage(err), 'both', requestBody)
+			const detail = loginErrorDetail(err)
+			if (detail === TOTP_REQUIRED) {
+				await openTotpStep(requestBody.email)
+				return
+			}
+			if (detail === TOTP_SETUP_REQUIRED) {
+				try {
+					const setup =
+						issuedSetup?.email === requestBody.email
+							? issuedSetup.setup
+							: await UserService.loginTotpSetup({
+									requestBody: { email: requestBody.email, password: requestBody.password }
+								})
+					issuedSetup = { email: requestBody.email, setup }
+					await openTotpStep(requestBody.email, setup)
+				} catch (setupErr) {
+					failLogin(loginErrorMessage(setupErr), 'both', requestBody)
+				}
+				return
+			}
+			const message = loginErrorMessage(err)
+			failLogin(message, message === TOTP_INVALID_MESSAGE ? 'totp' : 'both', requestBody)
 			return
 		}
 
+		if (offerTotpSetup && !requestBody.totp_code) {
+			// Refused when the account already has a second factor, or by a build or edition
+			// that cannot give it one: the login then simply goes on.
+			const setup = await UserService.setupTotp({
+				requestBody: { password: requestBody.password }
+			}).catch(() => undefined)
+			if (setup) {
+				enrollOptional = true
+				await openTotpStep(requestBody.email, setup)
+				return
+			}
+		}
+
+		await finishLogin()
+	}
+
+	// Turns the second factor on and, when it was required, starts the session in the same
+	// request; the recovery codes it returns are shown before leaving the page.
+	async function enableTotpAtLogin(): Promise<void> {
+		const requestBody = { email: email!, password: password!, code: totpCode }
+		try {
+			const { recovery_codes } = enrollOptional
+				? await UserService.enableTotp({ requestBody: { code: totpCode } })
+				: await UserService.loginTotpEnable({ requestBody })
+			noteSessionEmail(requestBody.email)
+			formError = undefined
+			enrollSetup = undefined
+			enrollCodes = recovery_codes
+		} catch (err) {
+			const message = loginErrorMessage(err)
+			failLogin(message, message === TOTP_INVALID_MESSAGE ? 'totp' : 'both', requestBody)
+		}
+	}
+
+	async function finishLogin(): Promise<void> {
 		formError = undefined
 		rememberLoginMethod({ kind: 'password' })
 
@@ -357,8 +486,8 @@
 				resolvedRd?.startsWith('/projects/import')
 			) {
 				goto(resolvedRd)
-			} else if (resolvedRd == '/#user-settings') {
-				goto(`/user/workspaces#user-settings`)
+			} else if (resolvedRd?.startsWith('/#') && parseAccountSettingsHash(resolvedRd.slice(1))) {
+				goto(`/user/workspaces${resolvedRd.slice(1)}`)
 			} else {
 				goto(`/user/workspaces${resolvedRd ? `?rd=${encodeURIComponent(resolvedRd)}` : ''}`)
 			}
@@ -759,130 +888,219 @@
 		<p class="text-sm text-center text-secondary py-4">Signing you in…</p>
 	{/if}
 
-	{#if !passwordFirst}
-		{@render providerButtons()}
-		{#if !autoRedirecting && !disablePasswordLogin && (saml || (logins && logins.length > 0))}
-			{@render orDivider()}
-			<!-- Only an entry point to the form below: once that is open the divider is what
-				separates the two ways in. -->
-			{#if !showPassword}
-				<div class="center-center">
-					<Button
-						unifiedSize="sm"
-						variant="subtle"
-						onClick={() => {
-							showPassword = true
-						}}
-					>
-						Log in without third-party
-					</Button>
-				</div>
-			{/if}
-		{/if}
-	{/if}
-
-	{#if !autoRedirecting && showPassword && !disablePasswordLogin}
-		<div>
-			{#if firstTime}
-				<p class="text-xs text-center w-full pb-4 text-secondary">
-					Welcome! Default credentials admin@windmill.dev / changeme have been prefilled.
+	{#if enrollCodes}
+		<div class="space-y-4">
+			<div class="space-y-1">
+				<h2 class="text-sm font-semibold text-emphasis">Two-factor authentication is on</h2>
+				<p class="text-xs text-secondary">
+					Logging in with your password now also asks for a code from your authenticator app.
 				</p>
-			{/if}
-			<div class="space-y-4">
-				{#if cloudHosted}
-					<p class="text-xs text-secondary pb-6">
-						To get credentials without the OAuth providers above, send an email at
-						contact@windmill.dev
+			</div>
+			<!-- Loaded on demand: the login page every visitor gets stays free of the QR encoder
+				and the code highlighter, which only these screens use. -->
+			{#await import('./settings/TotpRecoveryCodes.svelte') then { default: TotpRecoveryCodes }}
+				<TotpRecoveryCodes codes={enrollCodes} bind:saved={enrollSaved} />
+			{/await}
+			<Button onClick={finishLogin} variant="accent" unifiedSize="lg" disabled={!enrollSaved}>
+				Continue
+			</Button>
+		</div>
+	{:else if showTotp}
+		<div class="space-y-4">
+			<div class="space-y-1">
+				{#if enrollSetup && enrollOptional}
+					<h2 class="text-sm font-semibold text-emphasis">Set up two-factor authentication</h2>
+					<p class="text-xs text-secondary">
+						Protect {email} with a code from an authenticator app on top of its password. You can
+						also do this later from your user settings.
+					</p>
+				{:else if enrollSetup}
+					<h2 class="text-sm font-semibold text-emphasis">Set up two-factor authentication</h2>
+					<p class="text-xs text-secondary">
+						This instance asks for a code from an authenticator app at each password login. Add
+						{email} to your app to continue.
+					</p>
+				{:else}
+					<h2 class="text-sm font-semibold text-emphasis">Two-factor authentication</h2>
+					<p class="text-xs text-secondary">
+						Enter the code from your authenticator app for {email}, or one of your recovery codes.
 					</p>
 				{/if}
-				<div bind:this={fieldsEl} class="space-y-2 {shake ? 'motion-safe:animate-shake' : ''}">
-					<div class="space-y-1">
-						<label for={emailId} class="block text-xs font-semibold text-emphasis"> Email </label>
-						<div>
-							<TextInput
-								size="md"
-								error={emailErrored}
-								bind:value={email}
-								inputProps={{
-									id: emailId,
-									type: 'email',
-									autocomplete: 'username',
-									'aria-invalid': emailErrored ? 'true' : undefined,
-									'aria-describedby':
-										errorField === 'email' ? emailErrorId : emailErrored ? errorId : undefined,
-									onkeydown: (e) => {
-										// Only move on once the field holds something: while the browser's
-										// credential dropdown is open, Enter belongs to the dropdown
-										if (e.key === 'Enter' && !e.isComposing && !e.repeat && e.currentTarget.value) {
-											e.preventDefault()
-											passwordField?.focus()
-										}
-									}
-								}}
-							/>
-						</div>
-						<div id={emailErrorId} role="alert" class="min-h-5">
-							{#if errorField === 'email'}
-								<InputError error={credentialsError} />
-							{/if}
-						</div>
-					</div>
-
-					<div class="space-y-1">
-						<label for={passwordId} class="block text-xs font-semibold text-emphasis">
-							Password
-						</label>
-						<div>
-							<Password
-								bind:this={passwordField}
-								bind:password
-								id={passwordId}
-								placeholder=""
-								autocomplete="current-password"
-								allowMultiline={false}
-								error={passwordErrored}
-								describedBy={passwordErrored ? errorId : undefined}
-								onKeyDown={handleKeyDown}
-							/>
-						</div>
-						{@render errorMessage()}
-					</div>
-				</div>
-
-				<div>
-					<Button onClick={login} variant="accent" unifiedSize="lg" disabled={!email || !password}>
-						Log in
-					</Button>
-					{#if smtpConfigured}
-						<div class="text-center pt-2">
-							<a
-								href="/user/forgot-password"
-								class="text-2xs text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300"
-							>
-								Forgot password?
-							</a>
-						</div>
+			</div>
+			{#if enrollSetup}
+				{#await import('./settings/TotpAuthenticator.svelte') then { default: TotpAuthenticator }}
+					<TotpAuthenticator setup={enrollSetup} />
+				{/await}
+			{/if}
+			<div bind:this={fieldsEl} class="space-y-1 {shake ? 'motion-safe:animate-shake' : ''}">
+				<label for={totpId} class="block text-xs font-semibold text-emphasis">
+					{enrollSetup ? 'The 6-digit code your app shows' : 'Authentication code'}
+				</label>
+				<TextInput
+					bind:this={totpField}
+					size="md"
+					bind:value={totpCode}
+					error={!!errorField}
+					inputProps={{
+						id: totpId,
+						name: 'totp',
+						'aria-invalid': errorField ? 'true' : undefined,
+						'aria-describedby': errorField ? errorId : undefined,
+						autocomplete: 'one-time-code',
+						onkeydown: handleKeyDown
+					}}
+				/>
+				{@render errorMessage()}
+			</div>
+			<div class="space-y-2">
+				<Button onClick={login} variant="accent" unifiedSize="lg" disabled={!totpCode.trim()}>
+					{enrollOptional ? 'Turn on' : enrollSetup ? 'Turn on and log in' : 'Verify'}
+				</Button>
+				<div class="center-center">
+					{#if enrollOptional}
+						<Button unifiedSize="sm" variant="subtle" onClick={finishLogin}>Skip for now</Button>
+					{:else}
+						<Button unifiedSize="sm" variant="subtle" onClick={leaveTotp}>Back</Button>
 					{/if}
 				</div>
 			</div>
-
-			{#if cloudHosted}
-				<p class="text-2xs text-secondary mt-10 text-center">
-					By logging in, you agree to our
-					<a href="https://windmill.dev/terms_of_service" target="_blank" rel="noreferrer">
-						Terms of service
-					</a>
-					and
-					<a href="https://windmill.dev/privacy_policy" target="_blank" rel="noreferrer">
-						Privacy policy
-					</a>
-				</p>
-			{/if}
 		</div>
-	{/if}
+	{:else}
+		{#if !passwordFirst}
+			{@render providerButtons()}
+			{#if !autoRedirecting && !disablePasswordLogin && (saml || (logins && logins.length > 0))}
+				{@render orDivider()}
+				<!-- Only an entry point to the form below: once that is open the divider is what
+				separates the two ways in. -->
+				{#if !showPassword}
+					<div class="center-center">
+						<Button
+							unifiedSize="sm"
+							variant="subtle"
+							onClick={() => {
+								showPassword = true
+							}}
+						>
+							Log in without third-party
+						</Button>
+					</div>
+				{/if}
+			{/if}
+		{/if}
 
-	{#if passwordFirst && (saml || (logins && logins.length > 0))}
-		{@render orDivider()}
-		{@render providerButtons()}
+		{#if !autoRedirecting && showPassword && !disablePasswordLogin}
+			<div>
+				{#if firstTime}
+					<p class="text-xs text-center w-full pb-4 text-secondary">
+						Welcome! Default credentials admin@windmill.dev / changeme have been prefilled.
+					</p>
+				{/if}
+				<div class="space-y-4">
+					{#if cloudHosted}
+						<p class="text-xs text-secondary pb-6">
+							To get credentials without the OAuth providers above, send an email at
+							contact@windmill.dev
+						</p>
+					{/if}
+					<div bind:this={fieldsEl} class="space-y-2 {shake ? 'motion-safe:animate-shake' : ''}">
+						<div class="space-y-1">
+							<label for={emailId} class="block text-xs font-semibold text-emphasis"> Email </label>
+							<div>
+								<TextInput
+									size="md"
+									error={emailErrored}
+									bind:value={email}
+									inputProps={{
+										id: emailId,
+										type: 'email',
+										autocomplete: 'username',
+										'aria-invalid': emailErrored ? 'true' : undefined,
+										'aria-describedby':
+											errorField === 'email' ? emailErrorId : emailErrored ? errorId : undefined,
+										onkeydown: (e) => {
+											// Only move on once the field holds something: while the browser's
+											// credential dropdown is open, Enter belongs to the dropdown
+											if (
+												e.key === 'Enter' &&
+												!e.isComposing &&
+												!e.repeat &&
+												e.currentTarget.value
+											) {
+												e.preventDefault()
+												passwordField?.focus()
+											}
+										}
+									}}
+								/>
+							</div>
+							<div id={emailErrorId} role="alert" class="min-h-5">
+								{#if errorField === 'email'}
+									<InputError error={credentialsError} />
+								{/if}
+							</div>
+						</div>
+
+						<div class="space-y-1">
+							<label for={passwordId} class="block text-xs font-semibold text-emphasis">
+								Password
+							</label>
+							<div>
+								<Password
+									bind:this={passwordField}
+									bind:password
+									id={passwordId}
+									placeholder=""
+									autocomplete="current-password"
+									allowMultiline={false}
+									error={passwordErrored}
+									describedBy={passwordErrored ? errorId : undefined}
+									onKeyDown={handleKeyDown}
+								/>
+							</div>
+							{@render errorMessage()}
+						</div>
+					</div>
+
+					<div>
+						<Button
+							onClick={login}
+							variant="accent"
+							unifiedSize="lg"
+							disabled={!email || !password}
+						>
+							Log in
+						</Button>
+						{#if smtpConfigured}
+							<div class="text-center pt-2">
+								<a
+									href="/user/forgot-password"
+									class="text-2xs text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300"
+								>
+									Forgot password?
+								</a>
+							</div>
+						{/if}
+					</div>
+				</div>
+
+				{#if cloudHosted}
+					<p class="text-2xs text-secondary mt-10 text-center">
+						By logging in, you agree to our
+						<a href="https://windmill.dev/terms_of_service" target="_blank" rel="noreferrer">
+							Terms of service
+						</a>
+						and
+						<a href="https://windmill.dev/privacy_policy" target="_blank" rel="noreferrer">
+							Privacy policy
+						</a>
+					</p>
+				{/if}
+			</div>
+		{/if}
+
+		{#if passwordFirst && (saml || (logins && logins.length > 0))}
+			{@render orDivider()}
+			{@render providerButtons()}
+		{/if}
 	{/if}
 </div>

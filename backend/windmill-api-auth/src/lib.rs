@@ -106,6 +106,14 @@ pub struct ApiAuthed {
     /// Enforced by `AuthCache::get_opt_job_authed` against each request's client IP; a token
     /// minted from this identity through `tokens/create` is held within them.
     pub allowed_ips: Option<Vec<IpNet>>,
+    /// The token row this identity came from does not carry its owner's workspace admin rights
+    /// (`token.admin`): `is_admin` is already capped, and a credential minted from this identity
+    /// must not regain them.
+    pub admin_withheld: bool,
+    /// The token row this identity came from does not carry its owner's superadmin rights
+    /// (`token.super_admin`, sessions excepted). Superadmin gates key off the account's email,
+    /// so they must read this: [`require_super_admin`], [`is_super_admin_authed`].
+    pub super_admin_withheld: bool,
 }
 
 impl ApiAuthed {
@@ -201,6 +209,8 @@ impl From<Authed> for ApiAuthed {
             mcp_client: value.mcp_client,
             capabilities: value.capabilities,
             allowed_ips: None,
+            admin_withheld: false,
+            super_admin_withheld: false,
         }
     }
 }
@@ -325,6 +335,13 @@ pub async fn require_super_admin(db: &DB, authed: &ApiAuthed) -> error::Result<(
                 .to_owned(),
         ));
     }
+    if authed.super_admin_withheld {
+        return Err(Error::NotAuthorized(
+            "This endpoint requires superadmin rights, which this token does not carry. Create \
+             a token with 'Superadmin rights' turned on to call it."
+                .to_owned(),
+        ));
+    }
     require_super_admin_email(db, &authed.email).await
 }
 
@@ -333,7 +350,7 @@ pub async fn require_super_admin(db: &DB, authed: &ApiAuthed) -> error::Result<(
 /// A job's `WM_TOKEN` is never a superadmin regardless of whose email it carries
 /// (GHSA-hfh4-cx4h-3fcr), so callers naturally fall through to the restricted path.
 pub async fn is_super_admin_authed(db: &DB, authed: &ApiAuthed) -> error::Result<bool> {
-    if authed.job_id.is_some() {
+    if authed.job_id.is_some() || authed.super_admin_withheld {
         return Ok(false);
     }
     is_super_admin_email(db, &authed.email).await
@@ -598,7 +615,16 @@ pub fn ensure_scopes_within_caller(
     authed: &ApiAuthed,
     requested_scopes: Option<&[String]>,
 ) -> error::Result<()> {
-    if let Some(caller_restrictions) = scope_restrictions(authed.scopes.as_deref()) {
+    ensure_scopes_within(authed.scopes.as_deref(), requested_scopes)
+}
+
+/// Whether a credential holding `holder_scopes` covers `requested_scopes`, by the rules of
+/// [`ensure_scopes_within_caller`].
+pub fn ensure_scopes_within(
+    holder_scopes: Option<&[String]>,
+    requested_scopes: Option<&[String]>,
+) -> error::Result<()> {
+    if let Some(caller_restrictions) = scope_restrictions(holder_scopes) {
         let Some(requested_restrictions) = scope_restrictions(requested_scopes) else {
             return Err(Error::PermissionDenied(
                 "A scope-restricted token cannot create or update a token with broader (unscoped) \
@@ -665,7 +691,7 @@ pub fn ensure_scopes_within_caller(
     // not be able to mint or rescope a credential that drops or widens the fence
     // — even if the caller has no other scope restrictions (filter_tags-only
     // tokens otherwise look "unscoped" to `scope_restrictions`).
-    if let Some(caller_tags) = first_filter_tags(authed.scopes.as_deref()) {
+    if let Some(caller_tags) = first_filter_tags(holder_scopes) {
         let Some(requested_tags) = first_filter_tags(requested_scopes) else {
             return Err(Error::PermissionDenied(
                 "A token restricted by if_jobs:filter_tags cannot mint or rescope a token that \
@@ -685,6 +711,54 @@ pub fn ensure_scopes_within_caller(
     }
 
     Ok(())
+}
+
+/// What a stored token grants, as a token edit leaves it.
+pub struct TokenGrant<'a> {
+    pub scopes: Option<&'a [String]>,
+    pub super_admin: bool,
+    pub admin: bool,
+    pub allowed_ips: Option<&'a [IpNet]>,
+}
+
+/// Refuse a token edit that widens the token beyond what `authed` could mint through
+/// `tokens/create` right now. Widening a token in place is then never stronger than minting a
+/// new one: the scopes, the admin and superadmin rights and the IP allowlist are each held to
+/// the caller's, as minting holds them.
+pub fn ensure_grant_within_caller(authed: &ApiAuthed, grant: &TokenGrant) -> error::Result<()> {
+    ensure_scopes_within_caller(authed, grant.scopes)?;
+    let caller_scoped = authed
+        .scopes
+        .as_deref()
+        .is_some_and(|s| s.iter().any(|x| !x.starts_with("if_jobs:filter_tags:")));
+    if grant.super_admin && (caller_scoped || authed.super_admin_withheld) {
+        return Err(Error::NotAuthorized(
+            "Only an unscoped token carrying superadmin rights can widen a superadmin token"
+                .to_string(),
+        ));
+    }
+    if grant.admin && authed.admin_withheld {
+        return Err(Error::NotAuthorized(
+            "A token withholding workspace admin rights cannot widen a token carrying them"
+                .to_string(),
+        ));
+    }
+    if let Some(caller) = authed.allowed_ips.as_deref() {
+        if !ip_nets_within(caller, grant.allowed_ips) {
+            return Err(Error::PermissionDenied(
+                "A token restricted to IP addresses cannot widen a token beyond the networks it \
+                 may be used from itself"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether every network of `inner` lies within `outer`. `None` (usable from anywhere) lies
+/// within no list.
+pub fn ip_nets_within(outer: &[IpNet], inner: Option<&[IpNet]>) -> bool {
+    inner.is_some_and(|nets| nets.iter().all(|n| outer.iter().any(|o| o.contains(n))))
 }
 
 /// Tags from the first `if_jobs:filter_tags:<a,b,...>` scope, matching the
@@ -841,7 +915,20 @@ pub async fn require_devops_role(db: &DB, authed: &ApiAuthed) -> error::Result<(
                 .to_owned(),
         ));
     }
-    if is_devops_email(db, &authed.email).await? {
+    // `is_devops_email` is also true for a superadmin, which a token withholding those rights
+    // must not pass as: only the account's own devops role counts then.
+    let is_devops = if authed.super_admin_withheld {
+        sqlx::query_scalar!(
+            "SELECT devops FROM password WHERE email = $1",
+            &authed.email
+        )
+        .fetch_optional(db)
+        .await?
+        .unwrap_or(false)
+    } else {
+        is_devops_email(db, &authed.email).await?
+    };
+    if is_devops {
         Ok(())
     } else {
         Err(Error::NotAuthorized(
@@ -1208,6 +1295,8 @@ pub async fn fetch_api_authed_from_permissioned_as(
                 mcp_client: None,
                 capabilities: None,
                 allowed_ips: None,
+                admin_withheld: false,
+                super_admin_withheld: false,
             };
 
             API_AUTHED_CACHE.insert(
@@ -1239,9 +1328,15 @@ pub struct NewToken {
     pub workspace_id: Option<String>,
     #[serde(default)]
     pub read_only: Option<bool>,
-    /// An MCP token carries its owner's superadmin rights (every workspace) only when asked.
+    /// Whether the token carries its owner's superadmin rights (admin in every workspace, the
+    /// superadmin routes). `None` inherits them, except for an MCP token; the `tokens/create`
+    /// handler turns `None` into `false`. Never grants rights the owner or caller lacks.
     #[serde(default)]
     pub super_admin: Option<bool>,
+    /// Whether the token carries its owner's workspace admin rights, under the same rules as
+    /// `super_admin` (`None` inherits, the handler withholds unless asked).
+    #[serde(default)]
+    pub admin: Option<bool>,
     /// IPs or CIDRs the token may be used from; `None` is anywhere. [`create_token_internal`]
     /// validates it and holds it within the caller's own.
     #[serde(default)]
@@ -1265,6 +1360,7 @@ impl NewToken {
             workspace_id,
             read_only,
             super_admin: None,
+            admin: None,
             allowed_ips: None,
         }
     }
@@ -1314,7 +1410,14 @@ pub async fn create_token_internal(
         .scopes
         .as_deref()
         .is_some_and(|s| s.iter().any(|scope| scope.starts_with("mcp:")));
-    let is_super_admin = is_super_admin && (!is_mcp || token_config.super_admin == Some(true));
+    // Held within the caller's own credential, so a token withholding them cannot mint one back.
+    let is_super_admin = is_super_admin
+        && !authed.super_admin_withheld
+        && match token_config.super_admin {
+            Some(requested) => requested,
+            None => !is_mcp,
+        };
+    let carries_admin = token_config.admin.unwrap_or(true) && !authed.admin_withheld;
     // Here rather than in each handler: every token minted from a caller's identity (app SDK
     // and embed tokens, native trigger webhooks included) must inherit its IP restriction.
     let allowed_ips = token_ip_allowlist(
@@ -1335,8 +1438,8 @@ pub async fn create_token_internal(
     }
     let rows = sqlx::query!(
         "INSERT INTO token
-            (token_hash, token_prefix, token, email, label, expiration, super_admin, scopes, workspace_id, read_only, allowed_ips)
-            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text[]::cidr[]
+            (token_hash, token_prefix, token, email, label, expiration, super_admin, scopes, workspace_id, read_only, allowed_ips, admin)
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text[]::cidr[], $12
             WHERE $9::varchar IS NULL OR NOT EXISTS(
                 SELECT 1 FROM workspace WHERE id = $9 AND deleted = true
             )",
@@ -1351,6 +1454,7 @@ pub async fn create_token_internal(
         token_config.workspace_id,
         token_config.read_only.unwrap_or(false),
         allowed_ips.as_deref(),
+        carries_admin,
     )
     .execute(&mut *tx)
     .await?;
@@ -1368,6 +1472,17 @@ pub async fn create_token_internal(
     )
     .await;
 
+    let grant = TokenAuditGrant {
+        label: token_config.label.as_deref(),
+        expiration: token_config.expiration,
+        scopes: token_config.scopes.as_deref(),
+        workspace_id: token_config.workspace_id.as_deref(),
+        read_only: token_config.read_only.unwrap_or(false),
+        allowed_ips: allowed_ips.as_deref(),
+        admin: carries_admin,
+        super_admin: is_super_admin,
+    }
+    .params();
     audit_log(
         &mut *tx,
         authed,
@@ -1375,7 +1490,7 @@ pub async fn create_token_internal(
         ActionKind::Create,
         &"global",
         Some(t_prefix),
-        None,
+        Some(audit_params(&grant)),
     )
     .instrument(tracing::info_span!("token", email = &authed.email))
     .await?;
@@ -1411,6 +1526,59 @@ pub async fn register_token_expiry_notification(
     {
         tracing::error!("Failed to register token expiry notification: {}", e);
     }
+}
+
+/// What a minted token row holds, recorded on its creation's audit entry. Token edits record
+/// their fields' values before and after, so a token's history can be replayed from this.
+pub struct TokenAuditGrant<'a> {
+    pub label: Option<&'a str>,
+    pub expiration: Option<chrono::DateTime<chrono::Utc>>,
+    pub scopes: Option<&'a [String]>,
+    pub workspace_id: Option<&'a str>,
+    pub read_only: bool,
+    pub allowed_ips: Option<&'a [String]>,
+    pub admin: bool,
+    pub super_admin: bool,
+}
+
+impl TokenAuditGrant<'_> {
+    /// Each value JSON-encoded, so a `null` (none, never, anywhere) stays distinct from `""`.
+    pub fn params(&self) -> Vec<(&'static str, String)> {
+        let j = |v: serde_json::Value| v.to_string();
+        vec![
+            ("label", j(serde_json::json!(self.label))),
+            ("expiration", j(serde_json::json!(self.expiration))),
+            ("scopes", j(serde_json::json!(self.scopes))),
+            ("workspace_id", j(serde_json::json!(self.workspace_id))),
+            ("read_only", j(serde_json::json!(self.read_only))),
+            ("allowed_ips", j(serde_json::json!(self.allowed_ips))),
+            ("admin", j(serde_json::json!(self.admin))),
+            ("super_admin", j(serde_json::json!(self.super_admin))),
+        ]
+    }
+}
+
+/// Audit parameters from owned values, as `audit_log` takes them.
+pub fn audit_params<'a>(params: &'a [(&'a str, String)]) -> HashMap<&'a str, &'a str> {
+    params.iter().map(|(k, v)| (*k, v.as_str())).collect()
+}
+
+/// Replace a token's pending expiry notification after its expiration changed, so a token
+/// extended after its warning went out is warned again before the new date.
+pub async fn reset_token_expiry_notification(
+    tx: &mut sqlx::PgConnection,
+    token_hash: &str,
+    label: Option<&str>,
+    expiration: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    sqlx::query!(
+        "DELETE FROM token_expiry_notification WHERE token_hash = $1",
+        token_hash
+    )
+    .execute(&mut *tx)
+    .await?;
+    register_token_expiry_notification(tx, token_hash, label, expiration).await;
+    Ok(())
 }
 
 // ------------ Permission helpers ------------
@@ -1576,6 +1744,24 @@ pub fn require_path_read_access_for_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_nets_within_holds_lists_to_the_outer_networks() {
+        let nets = |v: &[&str]| v.iter().map(|x| x.parse().unwrap()).collect::<Vec<IpNet>>();
+        let outer = nets(&["10.0.0.0/8", "192.168.1.0/24"]);
+        assert!(ip_nets_within(
+            &outer,
+            Some(&nets(&["10.1.2.3/32", "192.168.1.0/25"]))
+        ));
+        assert!(!ip_nets_within(&outer, Some(&nets(&["10.0.0.0/7"]))));
+        assert!(!ip_nets_within(
+            &outer,
+            Some(&nets(&["10.1.0.0/16", "172.16.0.0/12"]))
+        ));
+        // Usable from anywhere lies within no list.
+        assert!(!ip_nets_within(&outer, None));
+        assert!(!ip_nets_within(&[], Some(&nets(&["10.0.0.1/32"]))));
+    }
 
     fn authed_with_scopes(scopes: Option<Vec<&str>>) -> ApiAuthed {
         ApiAuthed {

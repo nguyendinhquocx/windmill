@@ -25,6 +25,40 @@ Symbols, not line numbers, are cited: they drift less.
   access-token row, then its grant, the order the trigger also follows. A new path that writes a
   user's tokens and may revoke must lock that row first too. `leave_workspace` deletes no tokens
   and revokes nothing; `leave_instance` deletes every token of the account, as `delete_user` does.
+- **Two-factor (TOTP) guards `POST /auth/login` only** (`windmill-api-users/src/totp_ee.rs`,
+  with a stub in `totp_oss.rs`; a build without `enterprise` allows it for one user). The
+  password is checked first, so "Two-factor code required" tells only someone who knows the
+  password that a code is needed. Every other way into a session skips it on purpose: OAuth and
+  SAML (the provider owns the second factor), login links (minted by a superadmin, who can reset
+  the second factor anyway, and never for a superadmin or devops account), and `GET /users/refresh_token` (a session already exists).
+  Authenticator codes are single-use (`totp_last_step`), and so are the ten recovery codes, stored
+  as salted argon2 hashes (a code carries about 52 bits, too few for a plain digest) and are
+  accepted wherever a code is. Wrong codes are capped per account at 5 a minute on the
+  `password` row, so the cap holds across servers; the caller commits the count even when it
+  refuses the code. Without that cap, a known password leaves a 6-digit code as the only barrier.
+  Enrolling (`setup`) asks for the password again, so a stolen session cannot add its own
+  authenticator and lock the owner out of password login. A superadmin removes a lost second
+  factor with `POST /users/totp/reset/{user}`. The secret is
+  encrypted under the `admins` workspace key, and rotating that key re-encrypts it
+  (`set_encryption_key`); a secret left under an old key locks its user out. The global user
+  export leaves it out, as its files end up in git: an overwrite keeps the second factor of every
+  account it reinstates, and a push to another instance arrives without one.
+  The `require_totp` instance setting (enterprise only, `totp::required`) makes a password login
+  without a second factor answer "Two-factor setup required" once the password matched. The
+  account then enrolls before it has any session, through `POST /auth/login/totp/setup` and
+  `/auth/login/totp/enable`, which take the password again on each call; `enable` turns the
+  factor on and mints the session in one transaction, so no session exists without it. While
+  required, `disable` is refused; a superadmin `reset` is not, and sends the user back through
+  enrollment. Sessions minted before the setting was turned on stay valid until they expire,
+  but `refresh_token` no longer renews one for an account without a second factor, so it ends
+  within `MAX_SESSION_VALIDITY_SECONDS` and the next login goes through the setup. The app
+  warns in its last 30 minutes, and enrolling from the settings restores renewal.
+  Until an account enrolls, its password is its only factor: whoever logs in with it first
+  enrolls their own authenticator, so a password already stolen is not protected, and the owner
+  needs a superadmin `reset` to recover. Turning the factor on (in settings or at login), off,
+  regenerating its recovery codes and a superadmin `reset` each email the account's owner when
+  SMTP is set up (`totp_ee::notify`), after the change has committed, so a change made with a
+  stolen password or session reaches the owner.
 - **Sessions** are `token` rows with `label='session'` plus the HttpOnly `token` cookie, minted only
   by `create_session_token` (`windmill-api-users/src/users.rs`). `GET /api/users/refresh_token`
   mints one for any non-job token but returns plain text, no redirect.
@@ -36,6 +70,19 @@ Symbols, not line numbers, are cited: they drift less.
   expiry or another login changes or drops it. A session revoked server-side keeps its hint,
   so until `whoami` answers that browser still renders as its own last user.
 - **`tokens/impersonate`** (superadmin) returns a multi-use token and sets no cookie.
+- **Token risk flags** (rights the token was minted with and no scope narrows, not bound to a
+  workspace, no expiration, unused 90 days) are computed once, by the `token_risk` view, which also
+  marks the tokens the server expires or renews on its own (`self_managed`, no flags). The user's
+  `tokens/list` and `tokens/risk_counts` and the superadmin review read it: its counts
+  (`tokens/risk_counts_as_super_admin`) in CE, its list (`tokens/list_as_super_admin`, cursor-paged
+  on `(last_used_at, token_prefix)`) and `tokens/delete_as_super_admin/{email}/{prefix}` in EE
+  (`users_ee.rs`); `frontend/src/lib/components/settings/tokenRisks.ts` only words the flags.
+- **`GET /api/tokens/introspect`** describes the credential presenting it, never one named in
+  the request, and resolves it in the handler rather than through `ApiAuthed`: the route layer
+  would refuse a scoped token there, and a workspace-bound one resolves on no global route. Its
+  route verdict is `check_route_layer` (`windmill-api-auth/src/auth.rs`), the function the auth
+  extractor runs, plus the runnable scope of the run-by-path endpoints (`run_by_path_scope`); a
+  handler that checks a scope of its own and is missing there gets an over-reported "allowed".
 - **`max_token_expiration_days`** caps `POST /users/tokens/create` and `tokens/impersonate`, by
   shortening the stored expiration (`cap_token_expiration`), never by refusing: `wmill user
   create-token` and the editor's language-server token pick a lifetime without reading the
@@ -69,12 +116,44 @@ Symbols, not line numbers, are cited: they drift less.
   `ephemeral-` prefix needs no other change (keep it clear of `is_server_minted_label` if minted
   through `tokens/create`); a new prefix also goes into the SQL and Svelte mirrors that function's
   doc lists.
-- **A token's `super_admin` column is what lets it into a workspace its owner is not a member
-  of**, and makes a workspace-less MCP token list every workspace. `create_token_internal` copies
-  it from `password` for every token except an MCP one (an `mcp:` scope), which carries it only
-  when the request sets `super_admin`; the MCP OAuth approve stores the same request on its code
-  and refresh rows, and each exchange re-checks `password`. A new path minting an MCP token must
-  ask the same question, or it reaches a different set of workspaces than the other two.
+- **A token carries its owner's superadmin and workspace admin rights only when minted with
+  them** (`token.super_admin`, `token.admin`). `super_admin` lets a token into a workspace its
+  owner is not a member of and makes a workspace-less MCP token list every workspace; on any row
+  but a session it also decides the superadmin routes, which otherwise key off the account's
+  email: the auth lookup sets `ApiAuthed::super_admin_withheld`, read by `require_super_admin`,
+  `is_super_admin_authed` and `require_devops_role`, and `admin = false` caps `is_admin` there
+  (`admin_withheld`, also read by the cross-workspace `usr.is_admin` checks). `POST
+  /users/tokens/create` and `tokens/impersonate` withhold both unless the request sets them;
+  `create_token_internal` called directly (server-side mints) inherits them from the owner,
+  except for an MCP token's superadmin. Either way a token never gets rights the minting
+  credential withholds, and `GET /users/refresh_token` refuses one that withholds rights the
+  account holds, since a session carries them all. A job started by such a token runs with its
+  capped `is_admin` (and a `$WM_TOKEN` cannot reach `tokens/create`); but what the token deploys
+  or schedules runs later as its owner (`fetch_authed_from_permissioned_as`), with every right of
+  the account, as with scoped tokens. Losing superadmin follows the owner without
+  help from the caller: the deferred trigger `password_superadmin_demote_tokens` clears the column
+  on every token of an address that, at commit, no longer has a superadmin `password` row
+  (demotion, deletion, an import's delete-and-reinsert), and evicts each through
+  `notify_token_invalidation`. An email change does not fire it, since SCIM's rename leaves the
+  tokens under the old address. A promotion grants it to no existing token. The MCP OAuth approve
+  stores the `super_admin` request on its code and refresh rows, and each exchange re-checks
+  `password`. A new path minting a token must ask the same questions, or it reaches a different
+  set of workspaces than the others.
+- **Editing a token widens it only as far as the caller could mint it**
+  (`tokens/update_scopes`, `tokens/update_limits` for expiration and `allowed_ips`). Narrowing is
+  always allowed; a change that widens any of them (scopes outside the stored ones, a later or
+  removed expiration, networks outside the stored list or none) must leave a token
+  `ensure_grant_within_caller` accepts: scopes within the caller's, no superadmin unless the caller
+  is unscoped and carries it, no admin the caller withholds, networks within the caller's. A later
+  expiration goes through `cap_token_expiration`, and changing it re-registers the expiry warning.
+  Only user tokens (`is_user_token`) take limit edits, and only they or an MCP OAuth sign-in widen
+  scopes: a system token is minted narrow for wherever it is handed. Every job token is refused,
+  since `$WM_TOKEN` is unscoped and narrowing breaks whatever holds the token.
+- **A token's history replays from the audit log.** `users.token.create` and `users.impersonate`
+  record everything the row holds (`TokenAuditGrant`), and each edit records its fields before and
+  after (`update_limits` also which fields were asked for, and the requested expiration when the
+  ceiling shortened it). A new token path or column must keep both, or the chain breaks. Not
+  audited: the superadmin-demotion trigger, the expired-token sweep, and refused edits.
 - **Every superadmin route refuses a job token**: `require_super_admin`
   (`windmill-api-auth/src/lib.rs`) errors on `authed.job_id.is_some()`. A script that needs
   `users/create`, `tokens/impersonate`, `set_login_type`, … must use a dedicated superadmin user

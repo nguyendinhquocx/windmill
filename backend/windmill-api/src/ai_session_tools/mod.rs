@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use windmill_common::auth::create_jwt_token;
+use windmill_common::auth::create_jwt_token_withholding;
 
 use crate::db::ApiAuthed;
 
@@ -510,6 +510,16 @@ const INSTANCE_ROUTES: &[&str] = &[
     "/workspaces/users",
 ];
 
+/// Whether `w_id` has the shape of a workspace id (the `workspace.proper_id` alphabet).
+/// A caller-supplied workspace is spliced into API URLs, where `/`, `.`, `?` or `%`
+/// would move the call to another route.
+pub(crate) fn is_plain_workspace_id(w_id: &str) -> bool {
+    !w_id.is_empty()
+        && w_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
 /// The URL of an API call, refused unless it lands on the route its handler wrote.
 ///
 /// The JWT behind a call carries the caller's full rights, and paths embed arguments a
@@ -529,11 +539,8 @@ fn guarded_url(
         .strip_prefix("/w/")
         .and_then(|rest| rest.strip_prefix(w_id))
         .is_some_and(|rest| rest.starts_with('/'));
-    let workspace_is_plain = w_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if path.contains('#')
-        || !workspace_is_plain
+        || !is_plain_workspace_id(w_id)
         || !(in_workspace || INSTANCE_ROUTES.iter().any(|r| route.starts_with(r)))
     {
         return Err(refused());
@@ -704,7 +711,7 @@ pub(crate) async fn mint_caller_jwt(
     // uncapped token that satisfies require_super_admin / require_devops_role.
     // A browser caller stays a session: runs, trigger history and schedules attribute a
     // session's actions to the UI, and anything else to the API (`webhook`).
-    create_jwt_token(
+    create_jwt_token_withholding(
         windmill_common::db::Authed::from(api_authed.clone()),
         workspace_id,
         3600,
@@ -712,6 +719,7 @@ pub(crate) async fn mint_caller_jwt(
         api_authed.is_session_token.then(|| "session".to_string()),
         None,
         scopes,
+        (api_authed.admin_withheld, api_authed.super_admin_withheld),
     )
     .await
 }
@@ -732,7 +740,7 @@ pub(crate) struct ToolOutcome {
 
 /// The card tools only MCP Apps clients draw; the chat draws its own cards.
 #[cfg(feature = "mcp")]
-pub(crate) use views::{allowed as view_allowed, definitions as view_definitions};
+pub(crate) use views::{allowed as view_allowed, definitions as view_definitions, LOAD_CARD};
 
 pub(crate) async fn call_session_tool(
     ctx: &Ctx<'_>,
